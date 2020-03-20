@@ -1,0 +1,1410 @@
+create or replace PACKAGE BODY        "FTL_INV_INTR_SHIPMENT_VAL" 
+AS
+/*
+-------------------------------------------------------------
+Package Name    : FTL_INV_INTR_SHIPMENT_VAL.plb
+Author's Name   : Yogesh Deshpande
+Date Written    : 10-July-2013
+RICEW Object id : FTL_INV_I_259
+Purpose         : Package Body
+Program Style   : PL/SQL
+Maintenance History:
+Date:                Name                        Remarks
+-----------         -------------               ------------------
+10-July-2013         Yogesh D                    Draft Version
+12-Dec-2013          C. D.                       Defect 1: negative inventory should be allowed
+                                                 Defect 2: to_subinventory is not mandatory
+16-Dec-2013          C. D.                       Commented is_shipment_num_valid (for testing with legacy data), input Vidhu
+                                                 This will lead to change sin the receipt program !!
+01-Apr-2014          C. D.                       Check if UOM Conversion to primary UOM is defined
+09-SEP-2014          Hari AMS			 Added Logic for In transit Time derivation to get expected Receipt date
+02-Aug-2017          Suhasini                    Change in is_item_number_valid function.AMSEBS-962,978 INK THOWERS
+15-Nov-2017			 Priya						 Change for Auto-Receive for SHX
+10-Sep-2018			 Priya						 Changes made for MFG 2.1 to run program Org wise run - Parallel Run
+22-Oct-2018          Karthi              		 MFG-SR00453359 - Timezone modification on transaction_date
+14-Jan-2020			 Priya 						 Changes done as part of REQ000004388
+
+--------------------------------------------------------------
+*/
+--**********************************************************************
+--Function to Pre Validations .
+--**********************************************************************
+   FUNCTION pre_validations
+      RETURN NUMBER
+   IS
+      l_error_code   NUMBER := xx_emf_cn_pkg.cn_success;
+   BEGIN
+      xx_emf_pkg.write_log (xx_emf_cn_pkg.cn_low, 'Inside Pre-Validations');
+      RETURN l_error_code;
+   EXCEPTION
+      WHEN xx_emf_pkg.g_e_rec_error
+      THEN
+         l_error_code := xx_emf_cn_pkg.cn_rec_err;
+         RETURN l_error_code;
+      WHEN xx_emf_pkg.g_e_prc_error
+      THEN
+         l_error_code := xx_emf_cn_pkg.cn_prc_err;
+         RETURN l_error_code;
+      WHEN OTHERS
+      THEN
+         l_error_code := xx_emf_cn_pkg.cn_rec_err;
+         RETURN l_error_code;
+   END pre_validations;
+--**********************************************************************
+--Function to Data Validations .
+--**********************************************************************
+    FUNCTION data_validations (
+       io_mtl_transaction_stg_rec      IN OUT   ftl_inv_intr_shipment_int.rec_ftl_mtl_transaction_stg
+	   -- Added for MFG 2.1 Org wise run
+	   , p_org_code IN VARCHAR2
+    )
+    RETURN NUMBER
+    IS
+        l_error_code        NUMBER := xx_emf_cn_pkg.cn_success;
+        l_error_code_temp   NUMBER := xx_emf_cn_pkg.cn_success;
+        l_step              NUMBER := 0;
+		l_timezone         VARCHAR2(50); -- Added for Timezone modification on transaction_date SR00453359
+      l_transaction_Date DATE;         -- Added for Timezone modification on transaction_date SR00453359
+		l_intransit_type	VARCHAR2(10);  --Added for Auto-Receive for SHX
+        FUNCTION is_mandatory_values (
+                 i_from_organization      IN   VARCHAR2,
+                 i_transaction_date        IN     DATE,
+                 i_shipment_number        IN      VARCHAR2,
+                 i_item_number            IN      VARCHAR2,
+                 i_subinventory            IN      VARCHAR2,
+                 i_to_organization        IN   VARCHAR2,
+               --  i_to_subinventory        IN     VARCHAR2,       -- to_subinventory is not mandatory 12-Dec-2013
+			     i_to_subinventory        IN     VARCHAR2,  --Added for Auto-Receive for SHX
+                 i_uom                    IN   VARCHAR2,
+                 i_quantity                IN   VARCHAR2)
+        RETURN NUMBER
+        IS
+            l_error_code    NUMBER         := xx_emf_cn_pkg.cn_success;
+            l_null_string   VARCHAR2 (200);
+        BEGIN
+		--Added for Auto-Receive for SHX
+			BEGIN
+				SELECT INTRANSIT_TYPE
+					INTO l_intransit_type
+					FROM MTL_SHIPPING_NETWORK_VIEW
+				WHERE FROM_ORGANIZATION_CODE = i_from_organization
+				AND TO_ORGANIZATION_CODE     = i_to_organization ;
+			EXCEPTION
+				WHEN OTHERS
+			THEN
+				l_intransit_type := 0 ;
+			END;
+		--End of change for Auto-Receive for SHX
+            IF i_from_organization IS NULL OR i_transaction_date IS NULL OR i_shipment_number IS NULL
+               OR i_item_number IS NULL OR i_subinventory IS NULL 
+			   OR (i_to_subinventory IS NULL AND l_intransit_type = '1') --Added for Auto-Receive for SHX
+			   OR i_to_organization IS NULL OR i_uom IS NULL OR i_quantity IS NULL
+            THEN
+            SELECT    NVL2 (i_from_organization, '', 'From Organization,')
+                   || NVL2 (i_transaction_date, '', 'Transaction Date,')
+                   || NVL2 (i_shipment_number, '', 'Shipment Number')
+                   || NVL2 (i_item_number, '', 'Item Number')
+                   || NVL2 (i_subinventory, '', 'From Subinventory')
+                   || NVL2 (i_to_organization, '', 'To Organization')
+                  -- || NVL2 (i_to_subinventory, '', 'To Subinventory')  -- commented on 12-Dec-2013
+				   || NVL2 (i_to_subinventory, '', 'To Subinventory')  --Added for Auto-Receive for SHX
+                   || NVL2 (i_uom, '', 'UOM')
+                   || NVL2 (i_quantity, '', 'Quantity')
+              INTO l_null_string
+              FROM DUAL;
+            l_error_code := xx_emf_cn_pkg.cn_rec_err;
+            xx_emf_pkg.error
+               (p_severity                 => xx_emf_cn_pkg.cn_low,
+                p_category                 => xx_emf_cn_pkg.cn_valid,
+                p_error_text               =>    'Mandatory values for header not passed: '
+                                              || l_null_string,
+                p_record_identifier_1      => g_hdr_ref
+               );
+            RETURN l_error_code;
+         END IF;
+         RETURN l_error_code;
+      END is_mandatory_values;
+      FUNCTION is_org_valid (
+         i_org       IN   VARCHAR2,
+         i_from_to    IN      VARCHAR2
+      )
+      RETURN NUMBER
+      IS
+         l_error_code       NUMBER         := xx_emf_cn_pkg.cn_success;
+         l_organization_id  NUMBER;
+      BEGIN
+         SELECT organization_id
+         INTO l_organization_id
+         FROM mtl_parameters
+         WHERE organization_code = i_org;
+         RETURN l_error_code;
+      EXCEPTION
+         WHEN NO_DATA_FOUND
+         THEN
+            l_error_code := xx_emf_cn_pkg.cn_rec_err;
+            xx_emf_pkg.error (p_severity                    => xx_emf_cn_pkg.cn_low,
+                              p_category                    => xx_emf_cn_pkg.cn_valid,
+                              p_error_text                  => i_from_to||' Orgnization does not exist' || i_org,
+                              p_record_identifier_1         => g_hdr_ref
+                             );
+            RETURN l_error_code;
+         WHEN OTHERS
+         THEN
+            l_error_code := xx_emf_cn_pkg.cn_rec_err;
+            xx_emf_pkg.error (p_severity                    => xx_emf_cn_pkg.cn_low,
+                              p_category                    => xx_emf_cn_pkg.cn_valid,
+                              p_error_text                  => i_from_to||' Orgnization is invalid' || i_org,
+                              p_record_identifier_1         => g_hdr_ref
+                             );
+            RETURN l_error_code;
+      END is_org_valid;
+      FUNCTION is_item_number_valid (
+         i_org_from      IN   VARCHAR2,
+         i_org_to       IN   VARCHAR2,
+         i_item_number    IN      VARCHAR2
+		 --Below line added as part of REQ000004388
+		 , i_shipment_num IN VARCHAR2
+      )
+      RETURN NUMBER
+      IS
+
+         l_error_code       NUMBER := xx_emf_cn_pkg.cn_success;
+		 --#SIMMI0
+		 l_from_err_cd		NUMBER;
+		 l_to_err_cd		NUMBER;
+		 --#SIMMI0
+         l_item_number      VARCHAR2(40);
+		 l_itm_status VARCHAR2(10) := NULL;--Added for change as part of REQ000004388
+		 l_err_flag VARCHAR2(10) := 'N' ;--Added for change as part of REQ000004388
+      BEGIN
+			--#SIMMI0
+			BEGIN
+			--Code change as part of REQ000004388
+				BEGIN
+
+				SELECT msi.segment1, msi.INVENTORY_ITEM_STATUS_CODE
+				  INTO l_item_number, l_itm_status
+				  FROM mtl_system_items_b msi
+				 WHERE msi.segment1 = i_item_number
+				   AND msi.organization_id = 103
+				   ;
+				l_from_err_cd := xx_emf_cn_pkg.cn_success;
+			EXCEPTION
+				WHEN NO_DATA_FOUND THEN
+					xx_emf_pkg.error (p_severity                    => xx_emf_cn_pkg.cn_low,
+                              p_category                    => xx_emf_cn_pkg.cn_valid,
+                              p_error_text                  => 'Item is not defined in Oracle',
+                              p_record_identifier_1         => g_hdr_ref
+                             );
+							l_err_flag := 'Y';
+
+							BEGIN
+
+								UPDATE FTL_MTL_TRANSACTION_STG 
+									SET ERROR_MSG = 'Item is not defined in Oracle' 
+									WHERE SHIPMENT_NUMBER = i_shipment_num
+									AND ITEM_NUMBER = i_item_number 
+									;
+								COMMIT;
+
+								EXCEPTION WHEN OTHERS THEN
+									NULL;
+							END;
+
+
+					l_from_err_cd :=xx_emf_cn_pkg.cn_rec_err;
+					RETURN l_from_err_cd;
+			END;
+
+			BEGIN
+
+				IF l_itm_status ='Inactive' AND l_err_flag = 'N' THEN
+
+				l_err_flag := 'Y';
+					xx_emf_pkg.error (p_severity                    => xx_emf_cn_pkg.cn_low,
+                              p_category                    => xx_emf_cn_pkg.cn_valid,
+                              p_error_text                  => 'Item is inactive in Oracle',
+                              p_record_identifier_1         => g_hdr_ref
+                             );
+							--l_err_flag := 'Y';
+
+							BEGIN
+
+								UPDATE FTL_MTL_TRANSACTION_STG 
+									SET ERROR_MSG = 'Item is inactive in Oracle' 
+									WHERE SHIPMENT_NUMBER = i_shipment_num
+									AND ITEM_NUMBER = i_item_number 
+									;
+								COMMIT;
+
+								EXCEPTION WHEN OTHERS THEN
+									NULL;
+								END;
+
+
+					l_from_err_cd :=xx_emf_cn_pkg.cn_rec_err;
+					RETURN l_from_err_cd;
+					END IF;
+			END;
+			--End of change as part of REQ000004388
+			--#SIMMI0
+				SELECT distinct msi.segment1
+				  INTO l_item_number
+				  FROM mtl_system_items_b msi,
+					   mtl_parameters oog
+				 WHERE msi.organization_id = oog.organization_id
+				   AND msi.segment1 = i_item_number
+				   AND oog.organization_code in (i_org_from)
+				   AND msi.enabled_flag = 'Y'
+				   AND sysdate between nvl(msi.start_date_active,sysdate) and nvl(msi.end_date_active,sysdate);
+				--#SIMMI0
+				--RETURN l_error_code;
+				l_from_err_cd := xx_emf_cn_pkg.cn_success;
+				--#SIMMI0
+
+			EXCEPTION
+				WHEN NO_DATA_FOUND THEN
+					xx_emf_pkg.error (p_severity                    => xx_emf_cn_pkg.cn_low,
+                              p_category                    => xx_emf_cn_pkg.cn_valid,
+							  --#SIMMI0
+                              p_error_text                  => 'Item is not defined in From organization '||i_org_from||
+															'Or Not enabled Or Not active-'|| i_item_number,
+								--#SIMMI0
+                              p_record_identifier_1         => g_hdr_ref
+                             );
+							--Below code added as part of REQ000004388 
+							l_err_flag := 'Y';
+							BEGIN
+
+							 UPDATE FTL_MTL_TRANSACTION_STG 
+								SET ERROR_MSG = 'Item is not defined in From organization ' 
+								WHERE SHIPMENT_NUMBER = i_shipment_num
+								AND ITEM_NUMBER = i_item_number ;
+							COMMIT;
+
+							EXCEPTION WHEN OTHERS THEN
+								NULL;
+							END;
+
+
+							--End of change for REQ000004388
+					--#SIMMI0
+					--RETURN l_error_code;
+					--l_error_code := xx_emf_cn_pkg.cn_rec_err;
+					l_from_err_cd :=xx_emf_cn_pkg.cn_rec_err;
+					RETURN l_from_err_cd;
+					--#SIMMI0
+			    WHEN OTHERS THEN
+					xx_emf_pkg.error (p_severity                    => xx_emf_cn_pkg.cn_low,
+									  p_category                    => xx_emf_cn_pkg.cn_valid,
+									  p_error_text                  => ' Item number is invalid '|| i_item_number ||' Err-'||SQLERRM,
+									  p_record_identifier_1         => g_hdr_ref
+									 );
+					--#SIMMI0
+					--RETURN l_error_code;
+					--l_error_code := xx_emf_cn_pkg.cn_rec_err;
+					l_from_err_cd :=xx_emf_cn_pkg.cn_rec_err;
+					RETURN l_from_err_cd;
+			END;
+			BEGIN
+				SELECT distinct msi.segment1
+				  INTO l_item_number
+				  FROM mtl_system_items_b msi,
+					   mtl_parameters oog
+				 WHERE msi.organization_id = oog.organization_id
+				   AND msi.segment1 = i_item_number
+				   AND oog.organization_code in (i_org_to)
+				   AND msi.enabled_flag = 'Y'
+				   AND sysdate between nvl(msi.start_date_active,sysdate) and nvl(msi.end_date_active,sysdate);
+				--#SIMMI0
+				--RETURN l_error_code;
+				l_to_err_cd := xx_emf_cn_pkg.cn_success;
+				--#SIMMI0
+
+			EXCEPTION
+				WHEN NO_DATA_FOUND THEN
+					xx_emf_pkg.error (p_severity                    => xx_emf_cn_pkg.cn_low,
+                              p_category                    => xx_emf_cn_pkg.cn_valid,
+															--#SIMMI0
+                              p_error_text                  => 'Item is not defined in To Organization '||i_org_to||
+															   'Or Not enabled Or Not active-'|| i_item_number,
+															 --#SIMMI0
+                              p_record_identifier_1         => g_hdr_ref
+                             );
+						--Below code added as part of REQ000004388 
+						l_err_flag := 'Y';
+						BEGIN
+
+							 UPDATE FTL_MTL_TRANSACTION_STG 
+								SET ERROR_MSG = ERROR_MSG || ', ' || 'Item is not defined in To Organization '
+								WHERE SHIPMENT_NUMBER = i_shipment_num
+								AND ITEM_NUMBER = i_item_number ;
+							COMMIT;
+
+							EXCEPTION WHEN OTHERS THEN
+								NULL;
+							END;
+
+
+						--End of change for REQ000004388
+					--#SIMMI0
+					--RETURN l_error_code;
+					--l_error_code := xx_emf_cn_pkg.cn_rec_err;
+					l_to_err_cd :=xx_emf_cn_pkg.cn_rec_err;
+					RETURN l_to_err_cd;
+					--#SIMMI0
+			    WHEN OTHERS THEN
+					xx_emf_pkg.error (p_severity                    => xx_emf_cn_pkg.cn_low,
+									  p_category                    => xx_emf_cn_pkg.cn_valid,
+									  p_error_text                  => ' Item number is invalid '|| i_item_number ||' Err-'||SQLERRM,
+									  p_record_identifier_1         => g_hdr_ref
+									 );
+
+						--Below code added as part of REQ000004388 
+						l_err_flag := 'Y';
+							BEGIN
+
+							 UPDATE FTL_MTL_TRANSACTION_STG 
+								SET ERROR_MSG =  'Item number is invalid'
+								WHERE SHIPMENT_NUMBER = i_shipment_num
+								AND ITEM_NUMBER = i_item_number ;
+							COMMIT;
+
+							EXCEPTION WHEN OTHERS THEN
+								NULL;
+							END;
+
+
+						--End of change for REQ000004388
+					--#SIMMI0
+					--RETURN l_error_code;
+					--l_error_code := xx_emf_cn_pkg.cn_rec_err;
+					l_to_err_cd :=xx_emf_cn_pkg.cn_rec_err;
+					RETURN l_to_err_cd;
+			END;
+
+			IF (l_from_err_cd = xx_emf_cn_pkg.cn_success
+			    AND l_to_err_cd = xx_emf_cn_pkg.cn_success
+				) THEN
+				RETURN l_error_code;
+			END IF;
+
+      END is_item_number_valid;
+      FUNCTION is_subinventory_valid (
+         i_org            IN   VARCHAR2,
+         i_from_to        IN   VARCHAR2,
+         i_subinventory   IN   VARCHAR2
+      )
+      RETURN NUMBER
+      IS
+         l_error_code       NUMBER := xx_emf_cn_pkg.cn_success;
+         l_subinventory     VARCHAR2(40);
+      BEGIN
+         --
+         IF (i_subinventory IS NULL) THEN
+            RETURN l_error_code;
+         END IF;
+         -- added on 12-Dec-2013 -- to_subinventort is not mandatory
+         --
+            SELECT secondary_inventory_name
+              INTO l_subinventory
+              FROM mtl_secondary_inventories msi,
+                   mtl_parameters mp
+             WHERE msi.organization_id = mp.organization_id
+               AND msi.secondary_inventory_name = i_subinventory
+               AND mp.organization_code = i_org
+               AND nvl(msi.disable_date,sysdate-1) < sysdate;
+         RETURN l_error_code;
+      EXCEPTION
+         WHEN NO_DATA_FOUND
+         THEN
+            l_error_code := xx_emf_cn_pkg.cn_rec_err;
+            xx_emf_pkg.error (p_severity                    => xx_emf_cn_pkg.cn_low,
+                              p_category                    => xx_emf_cn_pkg.cn_valid,
+                              p_error_text                  => 'Subinventory not defined in '||i_from_to||'-'||
+                                                               i_org||' Or Not enabled Or Not active-'|| i_subinventory,
+                              p_record_identifier_1         => g_hdr_ref
+                             );
+            RETURN l_error_code;
+         WHEN OTHERS
+         THEN
+            l_error_code := xx_emf_cn_pkg.cn_rec_err;
+            xx_emf_pkg.error (p_severity                    => xx_emf_cn_pkg.cn_low,
+                              p_category                    => xx_emf_cn_pkg.cn_valid,
+                              p_error_text                  => 'Subinventory is invalid '|| i_subinventory ||' Err-'||SQLERRM,
+                              p_record_identifier_1         => g_hdr_ref
+                             );
+            RETURN l_error_code;
+      END is_subinventory_valid;
+      FUNCTION is_freight_valid (
+         i_freight_code   IN   VARCHAR2
+      )
+      RETURN NUMBER
+      IS
+         l_error_code       NUMBER := xx_emf_cn_pkg.cn_success;
+         l_freight_code     VARCHAR2(40);
+      BEGIN
+            SELECT freight_code
+              INTO l_freight_code
+              FROM wsh_carriers_v
+             WHERE active = 'A'
+               AND freight_code = i_freight_code;
+         RETURN l_error_code;
+      EXCEPTION
+         WHEN NO_DATA_FOUND
+         THEN
+            l_error_code := xx_emf_cn_pkg.cn_rec_err;
+            xx_emf_pkg.error (p_severity                    => xx_emf_cn_pkg.cn_low,
+                              p_category                    => xx_emf_cn_pkg.cn_valid,
+                              p_error_text                  => 'Freight code not defines Or Not Active '|| i_freight_code,
+                              p_record_identifier_1         => g_hdr_ref
+                             );
+            RETURN l_error_code;
+         WHEN OTHERS
+         THEN
+            l_error_code := xx_emf_cn_pkg.cn_rec_err;
+            xx_emf_pkg.error (p_severity                    => xx_emf_cn_pkg.cn_low,
+                              p_category                    => xx_emf_cn_pkg.cn_valid,
+                              p_error_text                  => 'Freight code is invalid '|| i_freight_code ||' Err-'||SQLERRM,
+                              p_record_identifier_1         => g_hdr_ref
+                             );
+            RETURN l_error_code;
+      END is_freight_valid;
+      FUNCTION is_reason_valid (
+         i_reason_name   IN   VARCHAR2
+      )
+      RETURN NUMBER
+      IS
+         l_error_code       NUMBER := xx_emf_cn_pkg.cn_success;
+         l_reason_name      VARCHAR2(40);
+      BEGIN
+            SELECT reason_name
+              INTO l_reason_name
+              FROM mtl_transaction_reasons
+             WHERE reason_name = i_reason_name
+               AND nvl(disable_date,sysdate-1) < sysdate;
+         RETURN l_error_code;
+      EXCEPTION
+         WHEN NO_DATA_FOUND
+         THEN
+            l_error_code := xx_emf_cn_pkg.cn_rec_err;
+            xx_emf_pkg.error (p_severity                    => xx_emf_cn_pkg.cn_low,
+                              p_category                    => xx_emf_cn_pkg.cn_valid,
+                              p_error_text                  => 'Reason not defined Or Not Active '|| i_reason_name,
+                              p_record_identifier_1         => g_hdr_ref
+                             );
+            RETURN l_error_code;
+         WHEN OTHERS
+         THEN
+            l_error_code := xx_emf_cn_pkg.cn_rec_err;
+            xx_emf_pkg.error (p_severity                    => xx_emf_cn_pkg.cn_low,
+                              p_category                    => xx_emf_cn_pkg.cn_valid,
+                              p_error_text                  => 'Reason is invalid '|| i_reason_name ||' Err-'||SQLERRM,
+                              p_record_identifier_1         => g_hdr_ref
+                             );
+            RETURN l_error_code;
+      END is_reason_valid;
+      FUNCTION is_onhand_qty (
+         i_org           IN   VARCHAR2,
+         i_item_number    IN   VARCHAR2,
+         i_subinv        IN   VARCHAR2,
+         i_qty            IN   NUMBER
+      )
+      RETURN NUMBER
+      IS
+        l_error_code       NUMBER := xx_emf_cn_pkg.cn_success;
+        l_org_id           NUMBER;
+        l_item_id          NUMBER;
+        l_return_status VARCHAR2 (1);
+        l_msg_data VARCHAR2 (4000);
+        l_msg_count NUMBER;
+        l_qoh NUMBER;
+        l_rqoh NUMBER;
+        l_qr NUMBER;
+        l_qs NUMBER;
+        l_att NUMBER;
+        l_atr NUMBER;
+        l_sqoh NUMBER;
+        l_srqoh NUMBER;
+        l_sqr NUMBER;
+        l_sqs NUMBER;
+        l_satt NUMBER;
+        l_sqtr NUMBER;
+      BEGIN
+            SELECT msi.inventory_item_id,
+                   mp.organization_id
+                   INTO
+                   l_item_id,
+                   l_org_id
+              FROM mtl_system_items msi,
+                   mtl_parameters mp
+             WHERE msi.organization_id = mp.organization_id
+               AND mp.organization_code = i_org
+               AND msi.segment1 = i_item_number;
+            inv_globals.set_org_id (l_org_id);
+            inv_quantity_tree_pub.clear_quantity_cache;
+            INV_QUANTITY_TREE_PUB.QUERY_QUANTITIES
+            (p_api_version_number => 1.0
+            , x_return_status => l_return_status
+            , x_msg_count => l_msg_count
+            , x_msg_data => l_msg_data
+            , p_organization_id => l_org_id
+            , p_inventory_item_id => l_item_id
+            , p_tree_mode => 1
+            , p_is_revision_control => FALSE
+            , p_is_lot_control => FALSE
+            , p_is_serial_control => FALSE
+            , p_grade_code => NULL
+            , p_revision => NULL
+            , p_lot_number => NULL
+            , p_subinventory_code => i_subinv
+            , p_locator_id => NULL
+            , x_qoh => l_qoh
+            , x_rqoh => l_rqoh
+            , x_qr => l_qr
+            , x_qs => l_qs
+            , x_att => l_att
+            , x_atr => l_atr
+            , x_sqoh => l_sqoh
+            , x_srqoh => l_srqoh
+            , x_sqr => l_sqr
+            , x_sqs => l_sqs
+            , x_satt => l_satt
+            , x_satr => l_sqtr
+            );
+         IF l_return_status !=  fnd_api.g_ret_sts_success THEN
+            l_error_code := xx_emf_cn_pkg.cn_rec_err;
+                 IF l_msg_count > 0 THEN
+                    FOR l_index IN 1 .. l_msg_count
+                    LOOP
+                       l_msg_data := l_msg_data||
+                            oe_msg_pub.get (p_msg_index      => l_index,
+                                            p_encoded        => 'F');
+                    END LOOP;
+                 END IF;
+            xx_emf_pkg.error (p_severity                    => xx_emf_cn_pkg.cn_low,
+                              p_category                    => xx_emf_cn_pkg.cn_valid,
+                              p_error_text                  => 'Onhand Quantity API ERROR-'||l_msg_data,
+                              p_record_identifier_1         => g_hdr_ref
+                             );
+         END IF;
+         IF i_qty  > l_att THEN
+            l_error_code := xx_emf_cn_pkg.cn_rec_err;
+            xx_emf_pkg.error (p_severity                    => xx_emf_cn_pkg.cn_low,
+                              p_category                    => xx_emf_cn_pkg.cn_valid,
+                              p_error_text                  => 'Not enough On hand quantity for item-'||i_item_number||'Transactable Qty-'||l_att||' Entered Qty-'||i_qty,
+                              p_record_identifier_1         => g_hdr_ref
+                             );
+         END IF;
+         RETURN l_error_code;
+      EXCEPTION
+         WHEN OTHERS
+         THEN
+            l_error_code := xx_emf_cn_pkg.cn_rec_err;
+            xx_emf_pkg.error (p_severity                    => xx_emf_cn_pkg.cn_low,
+                              p_category                    => xx_emf_cn_pkg.cn_valid,
+                              p_error_text                  => 'Other hand quantity check, Err-'||SQLERRM,
+                              p_record_identifier_1         => g_hdr_ref
+                             );
+            RETURN l_error_code;
+      END is_onhand_qty;
+      FUNCTION is_transaction_date_valid (
+         i_from_org          IN   VARCHAR2,
+         i_to_org          IN   VARCHAR2,
+         i_tran_date      IN   DATE
+		 --Below code added as part of REQ000004388 
+		  , i_item_number    IN      VARCHAR2
+         ,i_shipment_num   IN   VARCHAR2
+		 --End of change for REQ000004388
+      )
+      RETURN NUMBER
+      IS
+         l_error_code       NUMBER := xx_emf_cn_pkg.cn_success;
+         l_tran_date        VARCHAR2(40);
+         l_period_name      VARCHAR2(10);
+      BEGIN  /*Changed on 07/29 for open period issue*/
+            SELECT oap.period_name
+              INTO l_period_name
+             FROM apps.org_acct_periods_v oap,
+                   apps.mtl_parameters oog
+             WHERE oap.organization_id = oog.organization_id
+               AND oog.organization_code = i_from_org
+               AND oap.status = 'Open'
+               AND trunc(i_tran_date) between oap.start_date and oap.end_date;
+      IF SQL%FOUND THEN
+                l_error_code := xx_emf_cn_pkg.cn_success;
+            END IF;
+        RETURN l_error_code;
+      EXCEPTION
+        WHEN NO_DATA_FOUND
+         THEN
+            l_error_code := xx_emf_cn_pkg.cn_rec_err;
+            xx_emf_pkg.error (p_severity                    => xx_emf_cn_pkg.cn_low,
+                              p_category                    => xx_emf_cn_pkg.cn_valid,
+                              p_error_text                  => 'Transaction date not in open period '|| i_tran_date,
+                              p_record_identifier_1         => g_hdr_ref
+                             );
+				--Below code added as part of REQ000004388 
+							BEGIN
+
+							 UPDATE FTL_MTL_TRANSACTION_STG 
+								SET ERROR_MSG = 'Transaction date not in open period '|| i_tran_date
+								WHERE SHIPMENT_NUMBER = i_shipment_num
+								AND ITEM_NUMBER = i_item_number ;
+							COMMIT;
+
+							EXCEPTION WHEN OTHERS THEN
+								NULL;
+							END;
+						--End of change for REQ000004388
+            RETURN l_error_code;
+         WHEN OTHERS
+         THEN
+            l_error_code := xx_emf_cn_pkg.cn_rec_err;
+            xx_emf_pkg.error (p_severity                    => xx_emf_cn_pkg.cn_low,
+                              p_category                    => xx_emf_cn_pkg.cn_valid,
+                              p_error_text                  => 'Transaction date invalid '|| i_tran_date ||' Err-'||SQLERRM,
+                              p_record_identifier_1         => g_hdr_ref
+                             );
+            RETURN l_error_code;
+      END is_transaction_date_valid;
+      FUNCTION is_shipment_num_valid (
+         i_org              IN   VARCHAR2,
+         i_shipment_num   IN   VARCHAR2
+      )
+      RETURN NUMBER
+      IS
+         l_error_code       NUMBER := xx_emf_cn_pkg.cn_success;
+         l_shipment_num     VARCHAR2(40);
+      BEGIN
+            SELECT distinct shipment_num
+              INTO l_shipment_num
+              FROM rcv_shipment_headers rsh,
+                   mtl_parameters mp
+             WHERE rsh.organization_id = mp.organization_id
+               AND mp.organization_code = i_org
+               AND shipment_num = i_shipment_num;
+            IF SQL%FOUND THEN
+                l_error_code := xx_emf_cn_pkg.cn_rec_err;
+                xx_emf_pkg.error (p_severity                    => xx_emf_cn_pkg.cn_low,
+                                  p_category                    => xx_emf_cn_pkg.cn_valid,
+                                  p_error_text                  => 'Duplicate Shipment number invalid '|| i_shipment_num,
+                                  p_record_identifier_1         => g_hdr_ref
+                                 );
+                RETURN l_error_code;
+            END IF;
+      EXCEPTION
+        WHEN NO_DATA_FOUND
+         THEN
+            l_error_code := xx_emf_cn_pkg.cn_success;
+            RETURN l_error_code;
+         WHEN OTHERS
+         THEN
+            l_error_code := xx_emf_cn_pkg.cn_rec_err;
+            xx_emf_pkg.error (p_severity                    => xx_emf_cn_pkg.cn_low,
+                              p_category                    => xx_emf_cn_pkg.cn_valid,
+                              p_error_text                  => 'Shipment number invalid '|| i_shipment_num ||' Err-'||SQLERRM,
+                              p_record_identifier_1         => g_hdr_ref
+                             );
+            RETURN l_error_code;
+      END is_shipment_num_valid;
+
+
+
+      FUNCTION is_uom_valid
+      (
+         i_uom          IN     VARCHAR2,
+         i_org_code     IN     VARCHAR2,
+         i_item         IN     VARCHAR2,
+         o_error_msg    OUT    VARCHAR2
+      )
+      RETURN NUMBER
+      IS
+         l_error_code           NUMBER := xx_emf_cn_pkg.cn_success;
+         l_uom                  VARCHAR2(3);
+         l_primary_uom          VARCHAR2(3);
+         l_conversion_rate      NUMBER;
+         l_inventory_item_id    NUMBER;
+         l_conv_fact            NUMBER;
+         l_errmx                VARCHAR2(2000);
+      BEGIN
+          fnd_file.put_line(fnd_file.log, 'start of is_uom_valid ...');
+          BEGIN
+                SELECT uom_code
+                  INTO l_uom
+                  FROM mtl_units_of_measure mum
+                 WHERE UPPER (mum.uom_code) = UPPER (i_uom)
+                   AND NVL (mum.disable_date, SYSDATE) >= SYSDATE;
+               fnd_file.put_line(fnd_file.log, 'UOM found...');
+          EXCEPTION
+             WHEN NO_DATA_FOUND
+             THEN
+                l_error_code := xx_emf_cn_pkg.cn_rec_err;
+                xx_emf_pkg.error (p_severity                    => xx_emf_cn_pkg.cn_low,
+                                  p_category                    => xx_emf_cn_pkg.cn_valid,
+                                  p_error_text                  => 'UOM nod defined Or Disables'|| i_uom,
+                                  p_record_identifier_1         => g_hdr_ref
+                                 );
+                o_error_msg := 'UOM nod defined Or Disables'|| i_uom;
+                RETURN l_error_code;
+             WHEN OTHERS
+             THEN
+                l_errmx := SQLERRM;
+                l_error_code := xx_emf_cn_pkg.cn_rec_err;
+                xx_emf_pkg.error (p_severity                    => xx_emf_cn_pkg.cn_low,
+                                  p_category                    => xx_emf_cn_pkg.cn_valid,
+                                  p_error_text                  => 'UOM is invalid '|| i_uom ||' Err-'||l_errmx,
+                                  p_record_identifier_1         => g_hdr_ref
+                                 );
+                o_error_msg := 'UOM is invalid '|| i_uom ||' Err-'||l_errmx;
+                RETURN l_error_code;
+          END;
+          IF l_error_code = xx_emf_cn_pkg.cn_success THEN
+          BEGIN
+               SELECT msib.primary_uom_code,
+                      msib.inventory_item_id
+                 INTO l_primary_uom,
+                      l_inventory_item_id
+                 FROM mtl_system_items_b msib,
+                      mtl_parameters mp
+                WHERE msib.segment1 = i_item
+                  AND mp.organization_code = i_org_code
+                  AND msib.organization_id = mp.organization_id;
+               --
+               fnd_file.put_line(fnd_file.log, 'item primary UOM: ' || l_primary_uom);
+               --
+               IF l_primary_uom != i_uom THEN
+                  l_conv_fact := inv_convert.inv_um_convert
+                                  (
+                                   p_item_id          => 0,
+                                   p_from_uom_code    => i_uom,
+                                   p_to_uom_code      => l_primary_uom
+                                  );
+                  --
+                  fnd_file.put_line(fnd_file.log, 'Conversion factor = ' || l_conv_fact);
+                  --
+                  IF (l_conv_fact <= 0) THEN
+                     l_error_code := xx_emf_cn_pkg.cn_rec_err;
+                     o_error_msg := 'Convertion factor from : ' || i_uom || ' to : ' || l_primary_uom || ' is undefined';
+                     --
+                     xx_emf_pkg.error
+                     (
+                      p_severity                    => xx_emf_cn_pkg.cn_low,
+		      p_category                    => xx_emf_cn_pkg.cn_valid,
+		      p_error_text                  => 'Convertion factor from : ' || i_uom || ' to : ' || l_primary_uom || ' is undefined',
+		      p_record_identifier_1         => g_hdr_ref
+                     );
+                     --
+                  END IF;
+               END IF;
+               RETURN l_error_code;
+          EXCEPTION
+             WHEN NO_DATA_FOUND
+             THEN
+                l_error_code := xx_emf_cn_pkg.cn_rec_err;
+                xx_emf_pkg.error (p_severity                    => xx_emf_cn_pkg.cn_low,
+                                  p_category                    => xx_emf_cn_pkg.cn_valid,
+                                  p_error_text                  => 'Could not determine Primary UOM',
+                                  p_record_identifier_1         => g_hdr_ref
+                                 );
+                RETURN l_error_code;
+             WHEN OTHERS
+             THEN
+                l_errmx := SQLERRM;
+                l_error_code := xx_emf_cn_pkg.cn_rec_err;
+                xx_emf_pkg.error (p_severity                    => xx_emf_cn_pkg.cn_low,
+                                  p_category                    => xx_emf_cn_pkg.cn_valid,
+                                  p_error_text                  => 'Could not determine Primary UOM :' || l_errmx,
+                                  p_record_identifier_1         => g_hdr_ref
+                                 );
+                RETURN l_error_code;
+          END;
+          END IF;
+      END is_uom_valid;
+
+BEGIN
+      xx_emf_pkg.write_log (xx_emf_cn_pkg.cn_low, 'Inside Data-Validations');
+
+      g_hdr_ref := io_mtl_transaction_stg_rec.shipment_number;
+	 -- l_timezone         VARCHAR2(50); -- Added for Timezone modification on transaction_date SR00453359
+      --l_transaction_Date DATE;         -- Added for Timezone modification on transaction_date SR00453359
+
+      l_step := 10;
+	  l_error_code_temp := is_mandatory_values
+                   (i_from_organization      => io_mtl_transaction_stg_rec.from_organization,
+                    i_transaction_date        => io_mtl_transaction_stg_rec.transaction_date,
+                    i_shipment_number        => io_mtl_transaction_stg_rec.shipment_number,
+                    i_item_number            => io_mtl_transaction_stg_rec.item_number,
+                    i_subinventory            => io_mtl_transaction_stg_rec.subinventory,
+                    i_to_organization        => io_mtl_transaction_stg_rec.to_organization,
+                  --  i_to_subinventory        => io_mtl_transaction_stg_rec.to_subinventory, -- commented on 12-Dec-2013
+				    i_to_subinventory        => io_mtl_transaction_stg_rec.to_subinventory,  --Added for Auto-Receive for SHX
+                    i_uom                    => io_mtl_transaction_stg_rec.uom,
+                    i_quantity                => io_mtl_transaction_stg_rec.quantity);
+
+       io_mtl_transaction_stg_rec.error_code := ftl_common_util_pkg.find_max
+                                       (io_mtl_transaction_stg_rec.error_code,
+                                        l_error_code_temp
+                                       );
+       l_step := 11;
+
+       l_error_code_temp := is_org_valid(i_org     => io_mtl_transaction_stg_rec.from_organization,
+                                        i_from_to  => 'From');
+
+       io_mtl_transaction_stg_rec.error_code := ftl_common_util_pkg.find_max
+                                       (io_mtl_transaction_stg_rec.error_code,
+                                        l_error_code_temp
+                                       );
+       l_step := 12;
+
+       l_error_code_temp := is_item_number_valid(i_org_from     => io_mtl_transaction_stg_rec.from_organization,
+                                                 i_org_to       => io_mtl_transaction_stg_rec.to_organization,
+                                                 i_item_number  => io_mtl_transaction_stg_rec.item_number
+												 --Below line added as part of REQ000004388
+												 ,  i_shipment_num  => io_mtl_transaction_stg_rec.shipment_number
+												 );
+			--#SIMMI0 changes on 2nd Aug 2017
+        IF (l_error_code_temp = xx_emf_cn_pkg.cn_rec_err)THEN
+
+			BEGIN
+				UPDATE ftl_cust.ftl_mtl_transaction_stg
+				   SET process_code = xx_emf_cn_pkg.cn_valid,
+					   error_code = l_error_code_temp
+				 WHERE request_id = xx_emf_pkg.g_request_id
+				   AND shipment_number = io_mtl_transaction_stg_rec.shipment_number
+				   -- Added for MFG 2.1 Org wise run
+				   AND FROM_ORGANIZATION = p_org_code ;
+
+				COMMIT;
+			EXCEPTION
+				WHEN OTHERS THEN
+					xx_emf_pkg.error (p_severity                    => xx_emf_cn_pkg.cn_low,
+									  p_category                    => xx_emf_cn_pkg.cn_valid,
+									  p_error_text                  => 'Error while updating ftl_mtl_transaction_stg'||SQLERRM,
+									  p_record_identifier_1         => g_hdr_ref
+									 );
+			END;
+		END IF;
+		--#SIMMI0 End Changes
+
+       io_mtl_transaction_stg_rec.error_code := ftl_common_util_pkg.find_max
+                                       (io_mtl_transaction_stg_rec.error_code,
+                                        l_error_code_temp
+                                       );
+       l_step := 13;
+
+       l_error_code_temp := is_org_valid(i_org      => io_mtl_transaction_stg_rec.to_organization,
+                                         i_from_to  => 'To');
+       io_mtl_transaction_stg_rec.error_code := ftl_common_util_pkg.find_max
+                                       (io_mtl_transaction_stg_rec.error_code,
+                                        l_error_code_temp
+                                       );
+       l_step := 14;
+
+       l_error_code_temp := is_subinventory_valid(i_org          => io_mtl_transaction_stg_rec.from_organization,
+                                                  i_from_to      => 'From',
+                                                  i_subinventory => io_mtl_transaction_stg_rec.subinventory);
+       io_mtl_transaction_stg_rec.error_code := ftl_common_util_pkg.find_max
+                                       (io_mtl_transaction_stg_rec.error_code,
+                                        l_error_code_temp
+                                       );
+       l_step := 15;
+       l_error_code_temp := is_subinventory_valid(i_org          => io_mtl_transaction_stg_rec.to_organization,
+                                                  i_from_to      => 'To',
+                                                  i_subinventory => io_mtl_transaction_stg_rec.to_subinventory);
+       io_mtl_transaction_stg_rec.error_code := ftl_common_util_pkg.find_max
+                                       (io_mtl_transaction_stg_rec.error_code,
+                                        l_error_code_temp
+                                       );
+       l_step := 16;
+       If io_mtl_transaction_stg_rec.freight is not null THEN
+           l_error_code_temp := is_freight_valid(i_freight_code => io_mtl_transaction_stg_rec.freight);
+           io_mtl_transaction_stg_rec.error_code := ftl_common_util_pkg.find_max
+                                           (io_mtl_transaction_stg_rec.error_code,
+                                            l_error_code_temp
+                                           );
+       END IF;
+       l_step := 17;
+       If io_mtl_transaction_stg_rec.reason is not null THEN
+           l_error_code_temp := is_reason_valid(i_reason_name => io_mtl_transaction_stg_rec.reason);
+           io_mtl_transaction_stg_rec.error_code := ftl_common_util_pkg.find_max
+                                           (io_mtl_transaction_stg_rec.error_code,
+                                            l_error_code_temp
+                                           );
+       END IF;
+       --
+       -- Allow inventory to become negative: changed on 12-Dec-2013
+       --l_step := 18;
+       --    l_error_code_temp := is_onhand_qty(i_org         => io_mtl_transaction_stg_rec.from_organization,
+       --                                       i_item_number    => io_mtl_transaction_stg_rec.item_number,
+       --                                       i_subinv        => io_mtl_transaction_stg_rec.subinventory,
+       --                                       i_qty            => io_mtl_transaction_stg_rec.quantity
+       --                                      );
+       --    io_mtl_transaction_stg_rec.error_code := ftl_common_util_pkg.find_max
+       --                                    (io_mtl_transaction_stg_rec.error_code,
+       --                                     l_error_code_temp
+       --                                    );
+       --l_step := 19;
+       --    l_error_code_temp := is_shipment_num_valid(i_org             => io_mtl_transaction_stg_rec.from_organization,
+       --                                               i_shipment_num    => io_mtl_transaction_stg_rec.shipment_number
+       --                                               );
+       --    io_mtl_transaction_stg_rec.error_code := ftl_common_util_pkg.find_max
+       --                                    (io_mtl_transaction_stg_rec.error_code,
+       --                                     l_error_code_temp
+       --                                    );
+       l_step := 20;
+
+					--Added for Timezone modification on transaction_date SR00453359
+					fnd_file.put_line (fnd_file.log, 'Timezone modification Starts' || ' ' ||TO_CHAR(sysdate, 'dd-mon-yyyy hh24:mi:ss'));
+					BEGIN
+						SELECT timezone_code
+						INTO l_timezone
+						FROM hr_locations_v hlv,
+						hr_organization_units_v houv
+						WHERE houv.organization_id = io_mtl_transaction_stg_rec.from_organization
+						AND houv.location_id       = hlv.location_id;
+					EXCEPTION
+					WHEN OTHERS THEN
+					--	l_errm := SQLERRM;
+						fnd_file.put_line (fnd_file.log, 'Failed in fetching Timezone for Org: '|| io_mtl_transaction_stg_rec.from_organization );
+					END;
+					IF l_timezone        IS NULL THEN
+						l_transaction_Date := io_mtl_transaction_stg_rec.transaction_date;
+					ELSE
+						-- l_transaction_Date := NEW_TIME(TO_DATE(l_array_hdr1(z).transaction_date, 'DD-MON-YYYY HH24:MI:SS'), l_timezone, 'CST');
+						l_transaction_Date := CAST (from_tz(CAST (io_mtl_transaction_stg_rec.transaction_date AS TIMESTAMP),l_timezone) at TIME zone 'America/Chicago' AS DATE);
+					END IF;
+					fnd_file.put_line (fnd_file.log, 'Timezone modification Ends' || ' ' ||TO_CHAR(sysdate, 'dd-mon-yyyy hh24:mi:ss'));
+					fnd_file.put_line (fnd_file.log, 'Transaction Date := ' ||TO_CHAR(l_transaction_Date,'dd-mon-yyyy hh24:mi:ss'));
+					--End of Timezone modification on transaction_date SR00453359
+
+           l_error_code_temp := is_transaction_date_valid(i_from_org    => io_mtl_transaction_stg_rec.from_organization,
+                                                          --i_to_org         => io_mtl_transaction_stg_rec.to_organization, -- Commented for Timezone change on transaction date
+														  i_to_org         => l_transaction_Date,			-- modified for Timezone change on transaction date
+                                                          i_tran_date    => io_mtl_transaction_stg_rec.transaction_date
+														  --Below code added as part of REQ000004388
+														  ,i_item_number  => io_mtl_transaction_stg_rec.item_number
+															,i_shipment_num => io_mtl_transaction_stg_rec.shipment_number
+															--End of change for REQ000004388
+                                                          );
+           io_mtl_transaction_stg_rec.error_code := ftl_common_util_pkg.find_max
+                                           (io_mtl_transaction_stg_rec.error_code,
+                                            l_error_code_temp
+                                           );
+       --
+       l_step := 21;
+       l_error_code_temp := is_uom_valid
+                            (
+                             i_uom          => io_mtl_transaction_stg_rec.UOM,
+                             i_org_code     => io_mtl_transaction_stg_rec.from_organization,
+                             i_item         => io_mtl_transaction_stg_rec.item_number,
+                             o_error_msg    => io_mtl_transaction_stg_rec.error_msg
+                            );
+           io_mtl_transaction_stg_rec.error_code := ftl_common_util_pkg.find_max
+                                           (io_mtl_transaction_stg_rec.error_code,
+                                            l_error_code_temp
+                                           );
+
+     RETURN l_error_code;
+   EXCEPTION
+      WHEN xx_emf_pkg.g_e_rec_error
+      THEN
+         l_error_code := xx_emf_cn_pkg.cn_rec_err;
+         xx_emf_pkg.write_log (xx_emf_cn_pkg.cn_low,
+                                  'xx_emf_pkg.g_e_rec_error at step'
+                               || l_step
+                               || '=>'
+                               || SQLERRM
+                              );
+         xx_emf_pkg.error
+            (p_severity                 => xx_emf_cn_pkg.cn_low,
+             p_category                 => xx_emf_cn_pkg.cn_tech_error,
+             p_error_text               =>    'Stage 2:Data Validation: xx_emf_pkg.g_e_rec_error=>'
+                                           || SQLERRM,
+             p_record_identifier_1      => g_hdr_ref
+            );
+         RETURN l_error_code;
+      WHEN xx_emf_pkg.g_e_prc_error
+      THEN
+         l_error_code := xx_emf_cn_pkg.cn_prc_err;
+         xx_emf_pkg.write_log (xx_emf_cn_pkg.cn_low,
+                                  'xx_emf_pkg.g_e_prc_error at step'
+                               || l_step
+                               || '=>'
+                               || SQLERRM
+                              );
+         xx_emf_pkg.error
+            (p_severity                 => xx_emf_cn_pkg.cn_low,
+             p_category                 => xx_emf_cn_pkg.cn_tech_error,
+             p_error_text               =>    'Stage 2:Data Validation: xx_emf_pkg.g_e_prc_error=>'
+                                           || SQLERRM,
+             p_record_identifier_1      => g_hdr_ref
+            );
+         RETURN l_error_code;
+      WHEN OTHERS
+      THEN
+         l_error_code := xx_emf_cn_pkg.cn_rec_err;
+         xx_emf_pkg.write_log (xx_emf_cn_pkg.cn_low,
+                               'others at step' || l_step || '=>' || SQLERRM
+                              );
+         xx_emf_pkg.error
+                      (p_severity                 => xx_emf_cn_pkg.cn_low,
+                       p_category                 => xx_emf_cn_pkg.cn_tech_error,
+                       p_error_text               =>    'Stage 2:Data Validation: others=>'
+                                                     || SQLERRM,
+                       p_record_identifier_1      => g_hdr_ref
+                      );
+         RETURN l_error_code;
+END data_validations;
+--**********************************************************************
+--Function to Post Validations .
+--**********************************************************************
+   FUNCTION post_validations
+      RETURN NUMBER
+   IS
+      l_error_code  NUMBER := xx_emf_cn_pkg.cn_success;
+   BEGIN
+      xx_emf_pkg.write_log (xx_emf_cn_pkg.cn_low, 'Inside Post-Validations');
+      l_error_code  := xx_emf_cn_pkg.cn_success;
+         RETURN l_error_code;
+      EXCEPTION
+         WHEN OTHERS
+         THEN
+            l_error_code := xx_emf_cn_pkg.cn_rec_err;
+            RETURN l_error_code;
+   END post_validations;
+--**********************************************************************
+--Function to Data Derivations.
+--**********************************************************************
+   FUNCTION data_derivations (
+      io_mtl_transaction_stg      IN OUT   ftl_inv_intr_shipment_int.rec_ftl_mtl_transaction_stg
+    )
+      RETURN NUMBER
+   IS
+      l_error_code        NUMBER := xx_emf_cn_pkg.cn_success;
+      l_error_code_temp   NUMBER := xx_emf_cn_pkg.cn_success;
+      l_step              NUMBER := 0;
+      FUNCTION derive_org_id (
+         i_org       IN       VARCHAR2,
+         i_from_to  IN         VARCHAR2,
+         o_org_id   OUT      NUMBER
+      )
+         RETURN NUMBER
+      IS
+         l_error_code   NUMBER := xx_emf_cn_pkg.cn_success;
+      BEGIN
+         SELECT organization_id
+         INTO o_org_id
+         FROM mtl_parameters
+         WHERE organization_code = i_org;
+         RETURN l_error_code;
+      EXCEPTION
+         WHEN OTHERS
+         THEN
+            l_error_code := xx_emf_cn_pkg.cn_rec_err;
+            xx_emf_pkg.error (p_severity                 => xx_emf_cn_pkg.cn_low,
+                              p_category                 => xx_emf_cn_pkg.cn_valid,
+                              p_error_text               => i_from_to||' Organization Name invalid'|| i_org,
+                              p_record_identifier_1      => g_hdr_ref
+                             );
+            RETURN l_error_code;
+      END derive_org_id;
+      FUNCTION derive_item_id (
+         i_org_from      IN   VARCHAR2,
+         i_org_to        IN   VARCHAR2,
+         i_item_number   IN   VARCHAR2,
+         o_item_id       OUT  NUMBER
+      )
+      RETURN NUMBER
+      IS
+         l_error_code       NUMBER := xx_emf_cn_pkg.cn_success;
+      BEGIN
+            SELECT distinct msi.inventory_item_id
+              INTO o_item_id
+              FROM mtl_system_items_b msi,
+                   mtl_parameters oog
+             WHERE msi.organization_id = oog.organization_id
+               AND msi.segment1 = i_item_number
+               AND oog.organization_code in (i_org_from,i_org_to)
+               AND msi.enabled_flag = 'Y'
+               AND sysdate between nvl(msi.start_date_active,sysdate) and nvl(msi.end_date_active,sysdate);
+         RETURN l_error_code;
+      EXCEPTION
+         WHEN NO_DATA_FOUND
+         THEN
+            l_error_code := xx_emf_cn_pkg.cn_rec_err;
+            xx_emf_pkg.error (p_severity                    => xx_emf_cn_pkg.cn_low,
+                              p_category                    => xx_emf_cn_pkg.cn_valid,
+                              p_error_text                  => 'Item is not defined in either From organization '||i_org_from||
+                                                               'Or To Organization '||i_org_to|| 'Or Not enabled Or Not active-'|| i_item_number,
+                              p_record_identifier_1         => g_hdr_ref
+                             );
+            RETURN l_error_code;
+         WHEN OTHERS
+         THEN
+            l_error_code := xx_emf_cn_pkg.cn_rec_err;
+            xx_emf_pkg.error (p_severity                    => xx_emf_cn_pkg.cn_low,
+                              p_category                    => xx_emf_cn_pkg.cn_valid,
+                              p_error_text                  => ' Item number is invalid '|| i_item_number ||' Err-'||SQLERRM,
+                              p_record_identifier_1         => g_hdr_ref
+                             );
+            RETURN l_error_code;
+      END derive_item_id;
+      FUNCTION derive_tran_type_id(
+		 i_from_org_id	  IN   NUMBER, --Added for Auto-Receive for SHX
+		 i_to_org_id	  IN   NUMBER,  --Added for Auto-Receive for SHX
+         o_tran_type_id   OUT  NUMBER 
+
+      )
+      RETURN NUMBER
+      IS
+         l_error_code           NUMBER := xx_emf_cn_pkg.cn_success;
+		 l_instransit_type		VARCHAR2(10) := NULL; --Added for Auto-Receive for SHX
+	BEGIN 
+		--Below code Added for Auto-Receive for SHX
+			BEGIN
+				SELECT INTRANSIT_TYPE
+					INTO l_instransit_type
+					FROM MTL_SHIPPING_NETWORK_VIEW
+				WHERE FROM_ORGANIZATION_ID = i_from_org_id
+				AND TO_ORGANIZATION_ID     = i_to_org_id ;
+			EXCEPTION
+			WHEN NO_DATA_FOUND
+			THEN
+				l_error_code := xx_emf_cn_pkg.cn_rec_err;
+				xx_emf_pkg.error (p_severity                    => xx_emf_cn_pkg.cn_low,
+								p_category                    => xx_emf_cn_pkg.cn_valid,
+								p_error_text                  => 'Shipping network not defined',
+								p_record_identifier_1         => g_hdr_ref
+								);
+				RETURN l_error_code;
+			WHEN OTHERS
+			THEN
+				l_error_code := xx_emf_cn_pkg.cn_rec_err;
+				xx_emf_pkg.error (p_severity                    => xx_emf_cn_pkg.cn_low,
+								p_category                    => xx_emf_cn_pkg.cn_valid,
+								p_error_text                  => 'Shipping network not defined '||' Err-'||SQLERRM,
+								p_record_identifier_1         => g_hdr_ref
+								);
+				RETURN l_error_code;
+			END;
+
+
+	  IF l_instransit_type = '2' THEN
+      BEGIN
+	  --End of change for Auto-Receive for SHX
+            SELECT transaction_type_id
+              INTO o_tran_type_id
+            FROM mtl_transaction_types
+            WHERE transaction_type_name = 'Intransit Shipment';
+         RETURN l_error_code;
+      EXCEPTION
+         WHEN NO_DATA_FOUND
+         THEN
+            l_error_code := xx_emf_cn_pkg.cn_rec_err;
+            xx_emf_pkg.error (p_severity                    => xx_emf_cn_pkg.cn_low,
+                              p_category                    => xx_emf_cn_pkg.cn_valid,
+                              p_error_text                  => 'Transaction type Intransit Shipment not defined',
+                              p_record_identifier_1         => g_hdr_ref
+                             );
+            RETURN l_error_code;
+         WHEN OTHERS
+         THEN
+            l_error_code := xx_emf_cn_pkg.cn_rec_err;
+            xx_emf_pkg.error (p_severity                    => xx_emf_cn_pkg.cn_low,
+                              p_category                    => xx_emf_cn_pkg.cn_valid,
+                              p_error_text                  => 'Transaction type Intransit Shipment not defined '||' Err-'||SQLERRM,
+                              p_record_identifier_1         => g_hdr_ref
+                             );
+            RETURN l_error_code;
+		END;
+		--Below code added for Auto-Receive for SHX
+		ELSE
+			IF l_instransit_type = '1' THEN
+			BEGIN
+				SELECT transaction_type_id
+					INTO o_tran_type_id
+				FROM mtl_transaction_types
+				WHERE transaction_type_name = 'Direct Org Transfer';
+				RETURN l_error_code;
+			EXCEPTION
+				WHEN NO_DATA_FOUND
+				THEN
+				l_error_code := xx_emf_cn_pkg.cn_rec_err;
+				xx_emf_pkg.error (p_severity                    => xx_emf_cn_pkg.cn_low,
+                              p_category                    => xx_emf_cn_pkg.cn_valid,
+                              p_error_text                  => 'Transaction type Direct Org not defined',
+                              p_record_identifier_1         => g_hdr_ref
+                             );
+				RETURN l_error_code;
+				WHEN OTHERS
+				THEN
+				l_error_code := xx_emf_cn_pkg.cn_rec_err;
+				xx_emf_pkg.error (p_severity                    => xx_emf_cn_pkg.cn_low,
+                              p_category                    => xx_emf_cn_pkg.cn_valid,
+                              p_error_text                  => 'Transaction type Direct Org Shipment not defined '||' Err-'||SQLERRM,
+                              p_record_identifier_1         => g_hdr_ref
+                             );
+				RETURN l_error_code;
+			 END;
+			END IF;
+
+		END IF;
+		--End of change for Auto-Receive for SHX
+      END derive_tran_type_id;
+      FUNCTION derive_reason_id (
+         i_reason      IN   VARCHAR2,
+         o_reason_id   OUT  NUMBER
+      )
+      RETURN NUMBER
+      IS
+         l_error_code       NUMBER := xx_emf_cn_pkg.cn_success;
+      BEGIN
+            SELECT reason_id
+              INTO o_reason_id
+              FROM mtl_transaction_reasons
+             WHERE reason_name = i_reason;
+         RETURN l_error_code;
+      EXCEPTION
+         WHEN NO_DATA_FOUND
+         THEN
+            l_error_code := xx_emf_cn_pkg.cn_rec_err;
+            xx_emf_pkg.error (p_severity                    => xx_emf_cn_pkg.cn_low,
+                              p_category                    => xx_emf_cn_pkg.cn_valid,
+                              p_error_text                  => ' Reason not defined'|| i_reason,
+                              p_record_identifier_1         => g_hdr_ref
+                             );
+            RETURN l_error_code;
+         WHEN OTHERS
+         THEN
+            l_error_code := xx_emf_cn_pkg.cn_rec_err;
+            xx_emf_pkg.error (p_severity                    => xx_emf_cn_pkg.cn_low,
+                              p_category                    => xx_emf_cn_pkg.cn_valid,
+                              p_error_text                  => ' Other error in Reason Derivation '|| i_reason ||' Err-'||SQLERRM,
+                              p_record_identifier_1         => g_hdr_ref
+                             );
+            RETURN l_error_code;
+      END derive_reason_id;
+
+	 -- HARI AMS New function to Derive Intransit Time from Shipping network -- Start
+	  FUNCTION derive_expected_rcpt_date (
+         i_org_from       IN       VARCHAR2,
+         i_org_to  		  IN       VARCHAR2,
+		 i_tran_date  	  IN	   DATE,
+         o_exp_rcpt_date  OUT      DATE
+      )
+         RETURN NUMBER
+      IS
+         l_error_code   NUMBER := xx_emf_cn_pkg.cn_success;
+		 l_intransit_time NUMBER;
+      BEGIN
+
+		BEGIN
+         select intransit_time
+		 INTO l_intransit_time
+		 from apps.MTL_INTERORG_SHIP_METHODS
+		 where from_organization_id =i_org_from
+		 and to_organization_id= i_org_to
+		 and default_flag =1;
+		EXCEPTION
+		WHEN OTHERS THEN
+			xx_emf_pkg.write_log (xx_emf_cn_pkg.cn_low, 'Unable to Retrieve Intransit Time' ||SQLERRM);
+			l_intransit_time := 0;
+		END;
+		xx_emf_pkg.write_log (xx_emf_cn_pkg.cn_low, l_intransit_time || 'for'||i_org_from||'and'||i_org_to );
+		xx_emf_pkg.write_log (xx_emf_cn_pkg.cn_low, 'transaction date is '||i_tran_date );
+		o_exp_rcpt_date := i_tran_date + l_intransit_time;
+		xx_emf_pkg.write_log (xx_emf_cn_pkg.cn_low, 'Expected Receipt Date is '||o_exp_rcpt_date );
+
+
+         RETURN l_error_code;
+      EXCEPTION
+         WHEN OTHERS
+         THEN
+            l_error_code := xx_emf_cn_pkg.cn_rec_err;
+            xx_emf_pkg.error (p_severity                 => xx_emf_cn_pkg.cn_low,
+                              p_category                 => xx_emf_cn_pkg.cn_valid,
+                              p_error_text               => 'Error in Intransit Time derivation between'||i_org_from||'and'||i_org_to,
+                              p_record_identifier_1      => g_hdr_ref
+                             );
+            RETURN l_error_code;
+      END derive_expected_rcpt_date;
+
+	  -- HARI AMS New function to Derive Intransit Time from Shipping network -- END
+
+   BEGIN
+      xx_emf_pkg.write_log (xx_emf_cn_pkg.cn_low, 'Inside Data-Derivations');
+      g_hdr_ref := io_mtl_transaction_stg.shipment_number;
+      l_step := 10;
+      l_error_code_temp := derive_org_id (io_mtl_transaction_stg.from_organization,
+                                          'From',
+                                          io_mtl_transaction_stg.from_organization_id);
+      io_mtl_transaction_stg.error_code := ftl_common_util_pkg.find_max
+                                          (io_mtl_transaction_stg.error_code,
+                                           l_error_code_temp
+                                          );
+      l_step := 11;
+      l_error_code_temp := derive_org_id (io_mtl_transaction_stg.to_organization,
+                                          'To',
+                                          io_mtl_transaction_stg.to_organization_id);
+      io_mtl_transaction_stg.error_code := ftl_common_util_pkg.find_max
+                                          (io_mtl_transaction_stg.error_code,
+                                           l_error_code_temp
+                                          );
+      l_step := 12;
+      l_error_code_temp := derive_item_id(io_mtl_transaction_stg.from_organization,
+                                          io_mtl_transaction_stg.to_organization,
+                                          io_mtl_transaction_stg.item_number,
+                                          io_mtl_transaction_stg.item_id);
+       io_mtl_transaction_stg.error_code := ftl_common_util_pkg.find_max
+                                       (io_mtl_transaction_stg.error_code,
+                                        l_error_code_temp
+                                       );
+      l_step := 13;
+      l_error_code_temp := derive_tran_type_id(io_mtl_transaction_stg.from_organization_id  -- Added for Auto-Receive for SHX
+											  , io_mtl_transaction_stg.to_organization_id   -- Added for Auto-Receive for SHX
+											  , io_mtl_transaction_stg.transaction_type_id
+											  );  
+       io_mtl_transaction_stg.error_code := ftl_common_util_pkg.find_max
+                                       (io_mtl_transaction_stg.error_code,
+                                        l_error_code_temp
+                                       );
+      l_step := 14;
+      IF io_mtl_transaction_stg.reason is not null THEN
+      l_error_code_temp := derive_reason_id(io_mtl_transaction_stg.reason,
+                                            io_mtl_transaction_stg.reason_id
+                                            );
+       io_mtl_transaction_stg.error_code := ftl_common_util_pkg.find_max
+                                       (io_mtl_transaction_stg.error_code,
+                                        l_error_code_temp
+                                       );
+      END IF; --
+	  -- HARI AMS Start --New function to Derive Intransit Time from Shipping network
+	    l_step := 15;
+	  IF io_mtl_transaction_stg.expected_receipt_date is null THEN
+
+	  l_error_code_temp := derive_expected_rcpt_date(io_mtl_transaction_stg.from_organization_id,
+                                          io_mtl_transaction_stg.to_organization_id,
+										  io_mtl_transaction_stg.transaction_date,
+										  io_mtl_transaction_stg.expected_receipt_date
+                                            );
+		io_mtl_transaction_stg.error_code := ftl_common_util_pkg.find_max
+                                       (io_mtl_transaction_stg.error_code,
+                                        l_error_code_temp
+                                       );
+		END IF;
+		-- HARI AMS End -- New function to Derive Intransit Time from Shipping network
+
+
+      RETURN l_error_code;
+   EXCEPTION
+      WHEN OTHERS
+      THEN
+         xx_emf_pkg.error (p_severity                 => xx_emf_cn_pkg.cn_low,
+                           p_category                 => xx_emf_cn_pkg.cn_tech_error,
+                           p_error_text               =>    xx_emf_cn_pkg.cn_exp_unhand
+                                                         || 'Stage 3:Data Derivation',
+                           p_record_identifier_1      => g_hdr_ref
+                          );
+   END data_derivations;
+END ftl_inv_intr_shipment_val;

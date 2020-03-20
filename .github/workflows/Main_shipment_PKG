@@ -1,0 +1,1755 @@
+create or replace PACKAGE BODY        "FTL_INV_INTR_SHIPMENT_INT" 
+AS
+/*
+-------------------------------------------------------------
+Package Name    : FTL_INV_INTR_SHIPMENT_INT.plb
+Author's Name   : Yogesh Deshpande
+Date Written    : 12-Jan-2013
+RICEW Object id : FTL_INV_I_259
+Purpose         : Package Body
+Program Style   : PL/SQL
+tenance History:
+Date:                Name                        Remarks
+-----------         -------------               ------------------
+12-Jan-2013         Yogesh D                    Draft Version
+28-Oct-2013         Swati Dandekar              As per change request for Internal Org
+08-Nov-2013         C. D.                       shifting ISO Update after Material Inter org transfer txn.
+                                                launch_process_transaction
+                                                re-structuring of order to req. query links
+                                                adjusted FIFO logic
+16-Dec-2013         C. D.                       quantity will not be negative in the staging table. Converting at insert.
+16-Dec-2013         V. G                        Commented CSR mailing
+16-Dec-2013         V.G                         Changed the reference from case||'.'||Pallet to reference field
+17-Feb-2014         C. D.                       Tuning for Performance -- cur_line_data
+24-Feb-2014         C. D.                       Defect 842
+29-Mar-2014         C. D.                       Convert PKMS UOM to item Primary UOM: Michael.Harris by mail on 29-Mar-2014
+31-Mar-2014         C. D.                       Populate the PKMS QTY and UOM in the transaction_reference field: Joe
+08-Apr-2014            Yogesh D                    Used UPPER(PROCESS_CODE) in the procedure mark_records_for_processing.
+                                                Now it will hande process_code 'NEW', 'New', 'new', any process code will convert in upper case.
+30-Jul-2014         Hari                        AMS Incident 37304 -Commented the part of the code which would launch material transaction manager.
+20-Sept-2016        Jeremy Fletcher             AMSEBS-668 - I-259 would not process records due to null values for last_updated_by and last_update_date.
+22-AUG-2017         Rajesh                      CR00015554  - Would not process shipment with space.
+15-June-2017        Thulassiram Tummala         AMSEBS-962,978 INK THOWERS
+02-AUG-2017         Thulassiram Tummala         Bugfix in mark_records_for_processing AMSEBS-962,978
+15-Nov-2017			Priya						Change for Auto-Receive for SHX
+11-SEP-2018			Priya 						Changes made for MFG 2.1 to run program Org wise run - Parallel Run
+22-Oct-2018         Karthi              		MFG-SR00453359 - Timezone modification on transaction_date
+14-Jan-2020			Priya 						Changes done as part of REQ000004388
+----------------------------------------------------------------------------------------------------------------------------------------
+*/
+
+C_REC_NEW   VARCHAR2(3) := 'NEW';
+
+   PROCEDURE set_cnv_env (
+      p_required_flag   VARCHAR2 DEFAULT xx_emf_cn_pkg.cn_yes
+   )
+   IS
+      l_error_code   NUMBER := xx_emf_cn_pkg.cn_success;
+   BEGIN
+      -- Set the environment
+      l_error_code := xx_emf_pkg.set_env;
+      IF NVL (p_required_flag, xx_emf_cn_pkg.cn_yes) <> xx_emf_cn_pkg.cn_no
+      THEN
+         xx_emf_pkg.propagate_error (l_error_code);
+      END IF;
+   EXCEPTION
+      WHEN OTHERS
+      THEN
+         RAISE xx_emf_pkg.g_e_env_not_set;
+   END set_cnv_env;
+--------------------------------------------------------------------------------
+------------------< mark_records_for_processing >-------------------------------
+--------------------------------------------------------------------------------
+   PROCEDURE mark_records_for_processing (
+      p_restart_flag    IN   VARCHAR2
+	  -- Added for MFG 2.1 Org wise run
+	  ,p_org_code VARCHAR2
+   )
+   IS
+      PRAGMA AUTONOMOUS_TRANSACTION;
+   BEGIN
+      -- -- Update staging table for All Records
+      IF p_restart_flag = xx_emf_cn_pkg.cn_all_recs
+      THEN
+            UPDATE ftl_cust.ftl_mtl_transaction_stg
+               SET request_id = xx_emf_pkg.g_request_id,
+                   ERROR_CODE = xx_emf_cn_pkg.cn_null
+                   --process_code = C_REC_NEW
+             WHERE UPPER(process_code) = C_REC_NEW
+                                     --Condition added as part of ink throwers AMSEBS-962,978
+               AND to_organization NOT IN(SELECT a.organization_code
+	    					 FROM mtl_parameters a, ftl_lookup_values b
+	    					WHERE a.organization_code = b.meaning
+	    					  AND b.lookup_type = 'FTL_3PL_ORGANIZATIONS'
+					          AND b.enabled_flag = 'Y')
+							  -- Added for MFG 2.1 Org wise run
+							  AND FROM_ORGANIZATION = p_org_code ;
+      ELSIF p_restart_flag = xx_emf_cn_pkg.cn_err_recs
+      THEN
+            UPDATE ftl_cust.ftl_mtl_transaction_stg
+               SET request_id = xx_emf_pkg.g_request_id,
+                   ERROR_CODE = xx_emf_cn_pkg.cn_null,
+                   process_code = C_REC_NEW
+            WHERE UPPER(process_code) NOT IN ('NEW','PROCESS DATA')
+           -- WHERE UPPER(process_code) != C_REC_NEW Or process_code != xx_emf_cn_pkg.cn_process_data --ttumm0 2nd Aug 2017
+         -- Scenario 2 Data Validation Stage
+         --R UPDATE XXUNF_QP_LIST_HDR_PREINT
+                        --Condition added as part of ink throwers AMSEBS-962,978
+            AND to_organization NOT IN(SELECT a.organization_code
+	    			              FROM mtl_parameters a, ftl_lookup_values b
+	    				     WHERE a.organization_code = b.meaning
+	    				       AND b.lookup_type = 'FTL_3PL_ORGANIZATIONS'
+					       AND b.enabled_flag = 'Y'
+						   -- Added for MFG 2.1 Org wise run
+						   AND FROM_ORGANIZATION = p_org_code
+						   );
+
+         UPDATE ftl_cust.ftl_mtl_transaction_stg
+            SET request_id = xx_emf_pkg.g_request_id,
+                error_code = xx_emf_cn_pkg.cn_success,
+                process_code = xx_emf_cn_pkg.cn_preval
+          WHERE process_code = xx_emf_cn_pkg.cn_valid
+            AND error_code IN
+                   (xx_emf_cn_pkg.cn_null,
+                    xx_emf_cn_pkg.cn_rec_warn,
+                    xx_emf_cn_pkg.cn_rec_err)
+                        --Condition added as part of ink throwers AMSEBS-962,978
+            AND to_organization NOT IN(SELECT a.organization_code
+	    			              FROM mtl_parameters a, ftl_lookup_values b
+	    				     WHERE a.organization_code = b.meaning
+	    				       AND b.lookup_type = 'FTL_3PL_ORGANIZATIONS'
+					       AND b.enabled_flag = 'Y'
+						   -- Added for MFG 2.1 Org wise run
+						   AND FROM_ORGANIZATION = p_org_code
+						   );
+         -- Scenario 5 Process Data Stage
+         UPDATE ftl_cust.ftl_mtl_transaction_stg
+            SET request_id = xx_emf_pkg.g_request_id,
+                error_code = xx_emf_cn_pkg.cn_success,
+                process_code = xx_emf_cn_pkg.cn_postval
+          WHERE process_code = xx_emf_cn_pkg.cn_process_data
+            AND error_code IN (xx_emf_cn_pkg.cn_null, xx_emf_cn_pkg.cn_rec_err)
+                        --Condition added as part of ink throwers AMSEBS-962,978
+            AND to_organization NOT IN(SELECT a.organization_code
+	    			              FROM mtl_parameters a, ftl_lookup_values b
+	    				     WHERE a.organization_code = b.meaning
+	    				       AND b.lookup_type = 'FTL_3PL_ORGANIZATIONS'
+					       AND b.enabled_flag = 'Y')
+						   -- Added for MFG 2.1 Org wise run
+						   AND FROM_ORGANIZATION = p_org_code
+						   ;
+      END IF;
+      COMMIT;
+   EXCEPTION
+      WHEN OTHERS
+      THEN
+         fnd_file.put_line(1, ' Message:' || SQLERRM);
+   END mark_records_for_processing;
+-------------------------------------------------------------------------
+-----------< mark_records_complete >-------------------------------------
+-------------------------------------------------------------------------
+	-- Commented and added for MFG 2.1 Org wise run
+   --PROCEDURE mark_records_complete (p_process_code VARCHAR2)
+   PROCEDURE mark_records_complete (p_process_code VARCHAR2, p_org_code VARCHAR2)
+   IS
+      l_last_update_date    DATE   := SYSDATE;
+      l_last_updated_by     NUMBER := fnd_global.user_id;
+      l_last_update_login   NUMBER
+                             := fnd_profile.VALUE (xx_emf_cn_pkg.cn_login_id);
+      PRAGMA AUTONOMOUS_TRANSACTION;
+   BEGIN
+      UPDATE ftl_cust.ftl_mtl_transaction_stg
+         SET process_code = g_stage,
+             error_code = NVL (ERROR_CODE, xx_emf_cn_pkg.cn_success)
+       WHERE request_id = xx_emf_pkg.g_request_id
+         AND process_code = p_process_code
+         --       DECODE (p_process_code,
+         --               xx_emf_cn_pkg.cn_process_data, xx_emf_cn_pkg.cn_postval,
+         --               xx_emf_cn_pkg.cn_derive
+         --              )
+         AND error_code IN (xx_emf_cn_pkg.cn_success, xx_emf_cn_pkg.cn_rec_warn)
+		 -- Added for MFG 2.1 Org wise run
+		 AND FROM_ORGANIZATION = p_org_code
+		 ;
+      UPDATE ftl_cust.ftl_mtl_transaction_stg
+         SET process_code = g_stage,
+             ERROR_CODE = NVL (ERROR_CODE, xx_emf_cn_pkg.cn_success),
+             last_updated_by = l_last_updated_by,
+             last_update_date = l_last_update_date,
+             last_update_login = l_last_update_login
+       WHERE request_id = xx_emf_pkg.g_request_id
+         AND process_code = p_process_code
+         AND ERROR_CODE IN (xx_emf_cn_pkg.cn_success, xx_emf_cn_pkg.cn_rec_warn)
+		 -- Added for MFG 2.1 Org wise run
+		 AND FROM_ORGANIZATION = p_org_code
+		 ;
+      COMMIT;
+   EXCEPTION
+      WHEN OTHERS
+      THEN
+         fnd_file.put_line (1, ' Message:' || SQLERRM);
+   END mark_records_complete;
+-------------------------------------------------------------------------
+-----------< update_record_status >--------------------------------------
+-------------------------------------------------------------------------
+   PROCEDURE update_record_status (
+      io_rec_ftl_mtl_transaction_rec     IN OUT   rec_ftl_mtl_transaction_stg,
+      p_error_code                       IN       VARCHAR2
+   )
+   IS
+   BEGIN
+      xx_emf_pkg.write_log (xx_emf_cn_pkg.cn_low,
+                            'inside update_record_status'
+                           );
+      IF p_error_code IN (xx_emf_cn_pkg.cn_rec_err, xx_emf_cn_pkg.cn_prc_err)
+      THEN
+         io_rec_ftl_mtl_transaction_rec.ERROR_CODE := xx_emf_cn_pkg.cn_rec_err;
+      END IF;
+      io_rec_ftl_mtl_transaction_rec.process_code := g_stage;
+   END update_record_status;
+----------------------------------------------------------------------
+-------------------------< update_pre_interface_records >-------------
+----------------------------------------------------------------------
+   PROCEDURE update_pre_interface_records (
+      io_tbl_ftl_mtl_transaction_stg  IN OUT   tbl_ftl_mtl_transaction_stg
+   )
+   IS
+      l_last_update_date          DATE          := SYSDATE;
+      l_last_updated_by           NUMBER        := fnd_global.user_id;
+      l_last_update_login         NUMBER
+                             := fnd_profile.VALUE (xx_emf_cn_pkg.cn_login_id);
+      c_intf_act_code    CONSTANT VARCHAR2 (20) := 'INSERT';
+      c_process_flag     CONSTANT VARCHAR2 (1)  := 'Y';
+      c_process_status   CONSTANT VARCHAR2 (1)  := 'P';
+      l_step                      NUMBER;
+      l_err                       NUMBER;
+      PRAGMA AUTONOMOUS_TRANSACTION;
+   BEGIN
+      xx_emf_pkg.write_log (xx_emf_cn_pkg.cn_low,                        --low
+                            'update_pre_interface_records '
+                           );
+      l_step := 10;
+      FOR indx IN 1 .. io_tbl_ftl_mtl_transaction_stg.COUNT
+      LOOP
+         l_step := 100;
+         xx_emf_pkg.write_log (xx_emf_cn_pkg.cn_low,                     --low
+                                  'io_tbl_ftl_mtl_transaction_stg(indx).g_stage '
+                               || g_stage
+                              );
+         xx_emf_pkg.write_log
+                             (xx_emf_cn_pkg.cn_low,                      --low
+                                 'io_tbl_ftl_mtl_transaction_stg(indx).process_code '
+                              || io_tbl_ftl_mtl_transaction_stg (indx).process_code
+                             );
+         xx_emf_pkg.write_log (xx_emf_cn_pkg.cn_low,                     --low
+                                  'io_tbl_ftl_mtl_transaction_stg(indx).error_code '
+                               || io_tbl_ftl_mtl_transaction_stg (indx).ERROR_CODE
+                              );
+        Fnd_File.put_line (Fnd_File.LOG, 'Before stp 110'); -- Added for Deadlock issue (ORA-00060: deadlock detected while waiting for resource-60)
+         l_step := 110;
+         BEGIN  -- Added for Deadlock issue (ORA-00060: deadlock detected while waiting for resource-60)
+         UPDATE ftl_cust.ftl_mtl_transaction_stg
+            SET process_code = g_stage,
+                ERROR_CODE = ftl_common_util_pkg.find_max(ERROR_CODE,
+                                      io_tbl_ftl_mtl_transaction_stg(indx).ERROR_CODE
+                                     )
+          WHERE request_id = xx_emf_pkg.g_request_id
+            AND shipment_number = io_tbl_ftl_mtl_transaction_stg (indx).shipment_number
+          --  AND item_number = io_tbl_ftl_mtl_transaction_stg (indx).item_number
+            ;
+            -- Added for Deadlock issue (ORA-00060: deadlock detected while waiting for resource-60)
+            COMMIT; 
+        EXCEPTION WHEN OTHERS THEN
+            Fnd_File.put_line (Fnd_File.LOG, 'Exception in step 110 update ftl_mtl_transaction_stg');
+        END;
+        -- End of change for Deadlock issue (ORA-00060: deadlock detected while waiting for resource-60)
+
+        BEGIN   -- Added for Deadlock issue (ORA-00060: deadlock detected while waiting for resource-60)
+         UPDATE ftl_cust.ftl_mtl_transaction_stg
+            SET from_organization        =    io_tbl_ftl_mtl_transaction_stg (indx).from_organization,
+                from_organization_id    =    io_tbl_ftl_mtl_transaction_stg (indx).from_organization_id,
+                transaction_date        =    io_tbl_ftl_mtl_transaction_stg (indx).transaction_date,
+                transaction_type        =    io_tbl_ftl_mtl_transaction_stg (indx).transaction_type,
+                transaction_type_id        =    io_tbl_ftl_mtl_transaction_stg (indx).transaction_type_id,
+                shipment_number            =    io_tbl_ftl_mtl_transaction_stg (indx).shipment_number,
+                freight                    =    io_tbl_ftl_mtl_transaction_stg (indx).freight,
+                waybill_air_bill        =    io_tbl_ftl_mtl_transaction_stg (indx).waybill_air_bill,
+                containers                =    io_tbl_ftl_mtl_transaction_stg (indx).containers,
+                expected_receipt_date    =    io_tbl_ftl_mtl_transaction_stg (indx).expected_receipt_date,
+                item_number                =    io_tbl_ftl_mtl_transaction_stg (indx).item_number,
+                item_id                    =    io_tbl_ftl_mtl_transaction_stg (indx).item_id,
+                item_rev                =    io_tbl_ftl_mtl_transaction_stg (indx).item_rev,
+                subinventory            =    io_tbl_ftl_mtl_transaction_stg (indx).subinventory,
+                subinventory_id            =    io_tbl_ftl_mtl_transaction_stg (indx).subinventory_id,
+                locator                    =    io_tbl_ftl_mtl_transaction_stg (indx).locator,
+                to_organization            =    io_tbl_ftl_mtl_transaction_stg (indx).to_organization,
+                to_organization_id        =    io_tbl_ftl_mtl_transaction_stg (indx).to_organization_id,
+                to_subinventory            =    io_tbl_ftl_mtl_transaction_stg (indx).to_subinventory,
+                to_subinventory_id        =    io_tbl_ftl_mtl_transaction_stg (indx).to_subinventory_id,
+                to_locator                =    io_tbl_ftl_mtl_transaction_stg (indx).to_locator,
+                uom                        =    io_tbl_ftl_mtl_transaction_stg (indx).uom,
+                quantity                =    io_tbl_ftl_mtl_transaction_stg (indx).quantity,
+                reason                    =    io_tbl_ftl_mtl_transaction_stg (indx).reason,
+                reference                =    io_tbl_ftl_mtl_transaction_stg (indx).reference,
+                lot                        =    io_tbl_ftl_mtl_transaction_stg (indx).lot,
+                lot_quantity            =    io_tbl_ftl_mtl_transaction_stg (indx).lot_quantity,
+                start_serial_number        =    io_tbl_ftl_mtl_transaction_stg (indx).start_serial_number,
+                end_serial_number        =    io_tbl_ftl_mtl_transaction_stg (indx).end_serial_number,
+                last_update_date        =    l_last_update_date,--io_tbl_ftl_mtl_transaction_stg (indx).last_update_date,
+                last_updated_by            =   l_last_updated_by,-- io_tbl_ftl_mtl_transaction_stg (indx).last_updated_by,
+                last_update_login        =    io_tbl_ftl_mtl_transaction_stg (indx).last_update_login,
+                creation_date            =    io_tbl_ftl_mtl_transaction_stg (indx).creation_date,
+                created_by                =    io_tbl_ftl_mtl_transaction_stg (indx).created_by,
+                request_id                =    io_tbl_ftl_mtl_transaction_stg (indx).request_id
+                --error_code                =    io_tbl_ftl_mtl_transaction_stg (indx).error_code,
+                --process_code            =    io_tbl_ftl_mtl_transaction_stg (indx).process_code,
+                --Below line commented as part of REQ000004388 
+              --  ,error_msg                =    io_tbl_ftl_mtl_transaction_stg (indx).error_msg
+              --End of change for REQ000004388
+          WHERE   request_id = xx_emf_pkg.g_request_id
+            AND   shipment_number      = io_tbl_ftl_mtl_transaction_stg (indx).shipment_number
+            AND   item_number          = io_tbl_ftl_mtl_transaction_stg (indx).item_number
+            AND   SOA_TRANSMISSION_ID  = io_tbl_ftl_mtl_transaction_stg (indx).SOA_TRANSMISSION_ID;  -- defect 842
+            -- Added for Deadlock issue (ORA-00060: deadlock detected while waiting for resource-60)
+            COMMIT;
+        EXCEPTION WHEN OTHERS THEN
+            Fnd_File.put_line (Fnd_File.LOG, 'Exception in step 110 update 2 ftl_mtl_transaction_stg');
+        END;
+            -- End of change for Deadlock issue (ORA-00060: deadlock detected while waiting for resource-60)
+     END LOOP;
+      l_step := 107;
+      COMMIT;
+   EXCEPTION
+      WHEN OTHERS
+      THEN
+         fnd_file.put_line (fnd_file.LOG,
+                               'in update pre interface'
+                            || l_step
+                            || SQLERRM
+                            || SQLCODE
+                           );
+   END update_pre_interface_records;
+
+   -------------------------------------------------------------------------
+   -----------------<launch_process_transaction >------------------
+   ----------------------------------------------------------------------
+   /*PROCEDURE launch_process_transaction START Commented by Hari for AMS Incident 37304 - As suggested by VIdhu
+   IS
+      l_request_id NUMBER;
+      l_dev_phase  VARCHAR2(30) := 'Submitted';
+      l_wait       BOOLEAN;
+      l_ctr        NUMBER := 0;
+      l_phase      VARCHAR2(250);
+      l_status     VARCHAR2(250);
+      l_dev_status VARCHAR2(250);
+      l_message    VARCHAR2(250);
+   BEGIN
+      l_request_id :=  fnd_request.submit_request
+                       (
+                       application     => 'INV'
+                     , program         => 'INCTCM'
+                     , description     => 'Material Transactions - SRS'
+                       );
+      COMMIT;
+      --
+      WHILE (l_dev_phase != 'COMPLETE')
+      LOOP
+         l_wait:= fnd_concurrent.wait_for_request
+                  (
+                  request_id      => l_request_id
+                 ,interval        => 15
+                 ,max_wait        => 200
+                 ,phase           => l_PHASE
+                 ,status          => l_STATUS
+                 ,dev_phase       => l_dev_phase
+                 ,dev_status      => l_dev_status
+                 ,message         => l_message
+                  );
+         l_ctr := l_ctr + 1;
+         EXIT WHEN l_dev_phase = 'COMPLETE';
+         EXIT WHEN (l_ctr > 15);
+      END LOOP;
+      --
+   END launch_process_transaction;  END Commented by Hari for AMS Incident 37304 - As suggested by VIdhu*/
+
+   -------------------------------------------------------------------------
+   -----------------<checking_quantity >------------------
+   ----------------------------------------------------------------------
+   PROCEDURE CHECK_QUANTITY
+   IS
+   ------Declaration of the local variables-----------------------
+    l_msg                                    VARCHAR2 (2000);
+    l_error_code                             NUMBER                  := xx_emf_cn_pkg.cn_success;
+    l_sqlerrm                                VARCHAR2 (2000);
+    l_creation_date                          DATE     := SYSDATE;
+    l_created_by                             NUMBER   := fnd_global.user_id;
+    l_last_update_date                       DATE     := SYSDATE;
+    l_last_updated_by                        NUMBER   := fnd_global.user_id;
+    l_last_update_login                      NUMBER   := fnd_profile.VALUE (xx_emf_cn_pkg.cn_login_id);
+    l_prog_appl_id                           NUMBER   := fnd_global.prog_appl_id;
+    l_program_id                             NUMBER   := fnd_global.conc_program_id;
+    l_request_id                             NUMBER   := FND_PROFILE.VALUE('CONC_REQUEST_ID');
+    l_conv_fact                              NUMBER   := 1;
+      CURSOR cur_header_stag
+      IS
+         SELECT   *
+         FROM   ftl_mtl_transaction_stg
+         WHERE  1=1
+         AND    process_code = xx_emf_cn_pkg.cn_postval
+         AND    request_id = xx_emf_pkg.g_request_id;
+
+      CURSOR cur_line_data(l_item_id NUMBER,l_from_organization NUMBER,l_to_organization NUMBER)
+      IS
+         SELECT ola.ordered_quantity,
+                ola.header_id,
+                ola.line_id,
+                ola.line_type_id,
+                ola.ship_from_org_id,
+                ola.inventory_item_id,
+                ola.order_quantity_uom,
+                oh.order_number
+           FROM oe_order_headers_all oh,
+                oe_order_lines_all ola,
+                oe_order_sources os,
+                po_requisition_lines_all prl
+          WHERE ola.order_source_id             = os.order_source_id
+            AND os.name                         = 'Internal'
+            AND ola.header_id                   = oh.header_id
+            AND ola.inventory_item_id           = l_item_id
+            AND ola.ordered_quantity            > 0
+            and oh.FLOW_STATUS_CODE ='BOOKED'
+            and oh.open_flag='Y'
+            and ola.open_flag='Y'
+            AND OLA.flow_status_code            IN  ('BOOKED', 'AWAITING_SHIPPING' )
+            AND ola.source_document_line_id     = prl.requisition_line_id
+            --AND ola.source_document_id          = prl.requisition_header_id
+            AND prl.source_organization_id      = l_from_organization
+            AND prl.destination_organization_id = l_to_organization
+       ORDER BY oh.creation_date, ola.creation_date ASC;
+
+-------Declaration of Variable for updating the quantity--------
+l_header_rec_u                     oe_order_pub.header_rec_type;
+l_header_next_rec_u                oe_order_pub.header_rec_type;
+l_hold_header_rec_u                oe_order_pub.header_rec_type;
+l_line_table_u                     oe_order_pub.line_tbl_type;
+l_line_one_rec_table_u             oe_order_pub.line_tbl_type;
+l_action_request_table_u           oe_order_pub.request_tbl_type;
+l_out_header_rec_u                 oe_order_pub.header_rec_type;
+l_out_line_table_u                 oe_order_pub.line_tbl_type;
+l_out_bk_line_table_u              oe_order_pub.line_tbl_type;
+l_out_line_one_rec_table_u         oe_order_pub.line_tbl_type;
+l_out_header_val_rec_u             oe_order_pub.header_val_rec_type;
+l_out_header_adj_table_u           oe_order_pub.header_adj_tbl_type;
+l_out_header_adj_val_table_u       oe_order_pub.header_adj_val_tbl_type;
+l_out_header_price_att_table_u     oe_order_pub.header_price_att_tbl_type;
+l_out_header_adj_att_table_u       oe_order_pub.header_adj_att_tbl_type;
+l_out_header_adj_assoc_table_u     oe_order_pub.header_adj_assoc_tbl_type;
+l_out_header_scredit_table_u       oe_order_pub.header_scredit_tbl_type;
+l_out_header_scredit_val_tab_u     oe_order_pub.header_scredit_val_tbl_type;
+l_out_line_val_table_u             oe_order_pub.line_val_tbl_type;
+l_out_line_adj_table_u             oe_order_pub.line_adj_tbl_type;
+l_out_line_adj_val_table_u         oe_order_pub.line_adj_val_tbl_type;
+l_out_line_price_att_table_u       oe_order_pub.line_price_att_tbl_type;
+l_out_line_adj_att_table_u         oe_order_pub.line_adj_att_tbl_type;
+l_out_line_adj_assoc_table_u       oe_order_pub.line_adj_assoc_tbl_type;
+l_out_line_scredit_table_u         oe_order_pub.line_scredit_tbl_type;
+l_out_line_scredit_val_table_u     oe_order_pub.line_scredit_val_tbl_type;
+l_out_lot_serial_table_u           oe_order_pub.lot_serial_tbl_type;
+l_out_lot_serial_val_table_u       oe_order_pub.lot_serial_val_tbl_type;
+l_out_action_request_table_u       oe_order_pub.request_tbl_type;
+l_return_status_u                  VARCHAR2(1);
+l_msg_count_u                      NUMBER;
+l_msg_data_u                       VARCHAR2(4000);
+l_msg_index_out_u                  NUMBER;
+l_line_cnt_u                       NUMBER := 1;
+l_line_type_id                     NUMBER;
+l_status1                          VARCHAR2(20 BYTE);
+l_status2                          VARCHAR2(20 BYTE);
+-------Declaration of Variable for Canceling line and ISO--------
+l_api_version_number           NUMBER  := 1;
+l_return_status                VARCHAR2 (2000);
+l_msg_count                    NUMBER;
+l_msg_data                     VARCHAR2 (2000);
+-- IN Variables --
+l_header_rec                   oe_order_pub.header_rec_type;
+l_line_tbl                     oe_order_pub.line_tbl_type;
+l_action_request_tbl           oe_order_pub.request_tbl_type;
+l_line_adj_tbl                 oe_order_pub.line_adj_tbl_type;
+-- OUT Variables --
+l_header_rec_out               oe_order_pub.header_rec_type;
+l_header_val_rec_out           oe_order_pub.header_val_rec_type;
+l_header_adj_tbl_out           oe_order_pub.header_adj_tbl_type;
+l_header_adj_val_tbl_out       oe_order_pub.header_adj_val_tbl_type;
+l_header_price_att_tbl_out     oe_order_pub.header_price_att_tbl_type;
+l_header_adj_att_tbl_out       oe_order_pub.header_adj_att_tbl_type;
+l_header_adj_assoc_tbl_out     oe_order_pub.header_adj_assoc_tbl_type;
+l_header_scredit_tbl_out       oe_order_pub.header_scredit_tbl_type;
+l_header_scredit_val_tbl_out   oe_order_pub.header_scredit_val_tbl_type;
+l_line_tbl_out                 oe_order_pub.line_tbl_type;
+l_line_val_tbl_out             oe_order_pub.line_val_tbl_type;
+l_line_adj_tbl_out             oe_order_pub.line_adj_tbl_type;
+l_line_adj_val_tbl_out         oe_order_pub.line_adj_val_tbl_type;
+l_line_price_att_tbl_out       oe_order_pub.line_price_att_tbl_type;
+l_line_adj_att_tbl_out         oe_order_pub.line_adj_att_tbl_type;
+l_line_adj_assoc_tbl_out       oe_order_pub.line_adj_assoc_tbl_type;
+l_line_scredit_tbl_out         oe_order_pub.line_scredit_tbl_type;
+l_line_scredit_val_tbl_out     oe_order_pub.line_scredit_val_tbl_type;
+l_lot_serial_tbl_out           oe_order_pub.lot_serial_tbl_type;
+l_lot_serial_val_tbl_out       oe_order_pub.lot_serial_val_tbl_type;
+l_action_request_tbl_out       oe_order_pub.request_tbl_type;
+l_msg_index                    NUMBER;
+l_data                         VARCHAR2 (2000);
+l_loop_count                   NUMBER;
+l_debug_file                   VARCHAR2 (200);
+l_count                        NUMBER := 1;
+l_count_cancel                 NUMBER := 0;
+l_count_line                   NUMBER := 0;
+l_line_tbl_ISO                 oe_order_pub.line_tbl_type;
+l_qty                           NUMBER;
+l_var                           VARCHAR2(2);
+l_phase                        VARCHAR2 (100);
+l_status                       VARCHAR2 (100);
+l_dev_phase                    VARCHAR2 (100);
+l_dev_status                   VARCHAR2 (100);
+l_message                      VARCHAR2 (240);
+l_wait_request                 BOOLEAN;
+l_req_id                       NUMBER;
+l_interorg_qty                 NUMBER;
+l_emailID                      VARCHAR2(100);
+l_msg_index_out                NUMBER;
+----------------------------------------------------------------------------------
+BEGIN
+   --mo_global.init('ONT');
+     Fnd_File.put_line (Fnd_File.LOG, 'Check_quantity procedure starts......');
+    FOR cur_header_stag_rec IN cur_header_stag
+     LOOP
+         l_interorg_qty := abs(cur_header_stag_rec.quantity);
+         l_var:='N';
+         fnd_file.put_line(Fnd_File.LOG,'l_var  '||l_var);
+         Fnd_File.put_line (Fnd_File.LOG, 'Number of rows fetched from staging ='||cur_header_stag%ROWCOUNT);
+         Fnd_File.put_line (Fnd_File.LOG, 'Inside header loop......');
+         Fnd_File.put_line (Fnd_File.LOG,'Item_number'||cur_header_stag_rec.Item_number);
+         Fnd_File.put_line (Fnd_File.LOG,'from_organization_id'||cur_header_stag_rec.from_organization_id);
+         Fnd_File.put_line (Fnd_File.LOG,'to_organization_id'||cur_header_stag_rec.to_organization_id);
+             FOR cur_line_data_rec IN cur_line_data (cur_header_stag_rec.item_id,cur_header_stag_rec.FROM_ORGANIZATION_ID,cur_header_stag_rec.TO_ORGANIZATION_ID)
+             LOOP
+             --
+             IF (cur_header_stag_rec.UOM = cur_line_data_rec.order_quantity_uom) THEN
+                l_conv_fact := 1;
+             ELSE
+                l_conv_fact := inv_convert.inv_um_convert
+                               (
+                                p_item_id          => 0,
+                                p_from_uom_code    => cur_header_stag_rec.UOM,
+                                p_to_uom_code      => cur_line_data_rec.order_quantity_uom
+                               );
+                IF (l_conv_fact <= 0) THEN
+                   fnd_file.put_line(Fnd_File.LOG,'UOM Conversion failed from: ' || cur_header_stag_rec.UOM || ' to: ' || cur_line_data_rec.order_quantity_uom);
+                   l_conv_fact := 1;
+                ELSE
+                   fnd_file.put_line(Fnd_File.LOG,'UOM Conversion from: ' || cur_header_stag_rec.UOM || ' to: ' || cur_line_data_rec.order_quantity_uom || ' is = ' || l_conv_fact);
+                END IF;
+             END IF;
+             --
+             l_var:= 'Y';
+             fnd_file.put_line(Fnd_File.LOG,'l_var  '||l_var);
+             Fnd_File.put_line (Fnd_File.LOG, 'Number of rows fetched in line interface='||cur_line_data%ROWCOUNT);
+             Fnd_File.put_line (Fnd_File.LOG, 'Inside line loop......');
+             Fnd_File.put_line (Fnd_File.LOG, ' cur_header_stag_rec.quantity  ' ||abs(cur_header_stag_rec.quantity));
+             Fnd_File.put_line (Fnd_File.LOG, ' cur_line_data_rec.ordered_quantity  '||cur_line_data_rec.ordered_quantity);
+             -----------------------------Check for  IO quantity < ISO qty-------------------------------------
+                IF((l_interorg_qty * l_conv_fact) < cur_line_data_rec.ordered_quantity)    THEN
+                         Fnd_File.put_line (Fnd_File.LOG, ' IO Quantity  is less than ISO quantity  ');
+                         Fnd_File.put_line (Fnd_File.LOG, ' cur_header_stag_rec.quantity  ' ||abs(cur_header_stag_rec.quantity));
+                        Fnd_File.put_line (Fnd_File.LOG, ' cur_line_data_rec.ordered_quantity  '||cur_line_data_rec.ordered_quantity);
+                         l_qty := cur_line_data_rec.ordered_quantity - (l_interorg_qty * l_conv_fact);
+                         l_interorg_qty := 0;
+                                          Fnd_File.put_line (Fnd_File.LOG, ' cur_line_data_rec.HEADER_ID  '||cur_line_data_rec.HEADER_ID);
+                                          Fnd_File.put_line (Fnd_File.LOG, ' cur_line_data_rec.LINE_ID  '||cur_line_data_rec.LINE_ID);
+                                          Fnd_File.put_line (Fnd_File.LOG, ' cur_line_data_rec.line_type_id  '||cur_line_data_rec.line_type_id);
+                                          Fnd_File.put_line (Fnd_File.LOG, ' cur_line_data_rec.ship_from_org_id  '||cur_line_data_rec.ship_from_org_id);
+                                          Fnd_File.put_line (Fnd_File.LOG, ' cur_line_data_rec.inventory_item_id '||cur_line_data_rec.inventory_item_id);
+                                          Fnd_File.put_line (Fnd_File.LOG, ' cur_line_data_rec.order_quantity_uom '||cur_line_data_rec.order_quantity_uom);
+                                          Fnd_File.put_line (Fnd_File.LOG, ' l_qty '||l_qty);
+                                          l_line_table_u(l_line_cnt_u)                       := oe_order_pub.g_miss_line_rec;
+                                          l_line_table_u(l_line_cnt_u).operation             := oe_globals.G_OPR_UPDATE;
+                                          l_line_table_u(l_line_cnt_u).header_id             := cur_line_data_rec.HEADER_ID; --265551
+                                          l_line_table_u(l_line_cnt_u).line_id               := cur_line_data_rec.LINE_ID;    --210391;        --510836;
+                                         -- l_line_table_u(l_line_cnt_u).line_type_id          := cur_line_data_rec.line_type_id;--1045;--l_line_type_id;--1049;--1046;
+                                         -- l_line_table_u(l_line_cnt_u).ship_from_org_id      := cur_line_data_rec.ship_from_org_id;   -- 145;
+                                         -- l_line_table_u(l_line_cnt_u).inventory_item_id     := cur_line_data_rec.inventory_item_id;  --434612;
+                                         -- l_line_table_u(l_line_cnt_u).order_quantity_uom    := cur_line_data_rec.order_quantity_uom;--'EA';--l_uom_code;--'EA';--cur_line_process_rec.UNIT_OF_MEASURE;
+                                          l_line_table_u(l_line_cnt_u).ordered_quantity      := l_qty;--10;--l_tot_qty;   --7;
+                                         -- l_line_table_u(l_line_cnt_u).calculate_price_flag  := 'Y';
+                                          l_line_table_u(l_line_cnt_u).change_reason := 'Not provided'; ---added
+                                          oe_order_pub.process_order ( p_api_version_number        => 1,
+                                                                       p_init_msg_list             => fnd_api.g_true,
+                                                                       p_return_values             => fnd_api.g_false,
+                                                                       p_action_commit             => fnd_api.g_false,
+                                                                       x_return_status             => l_return_status_u,
+                                                                       x_msg_count                 => l_msg_count_u,
+                                                                       x_msg_data                  => l_msg_data_u,
+                                                                       p_header_rec                => l_header_rec_u,
+                                                                       p_line_tbl                  => l_line_table_u,
+                                                                       p_action_request_tbl        => l_action_request_table_u,
+                                                                       x_header_rec                => l_out_header_rec_u,
+                                                                       x_header_val_rec            => l_out_header_val_rec_u,
+                                                                       x_header_adj_tbl            => l_out_header_adj_table_u,
+                                                                       x_header_adj_val_tbl        => l_out_header_adj_val_table_u,
+                                                                       x_header_price_att_tbl      => l_out_header_price_att_table_u,
+                                                                       x_header_adj_att_tbl        => l_out_header_adj_att_table_u,
+                                                                       x_header_adj_assoc_tbl      => l_out_header_adj_assoc_table_u,
+                                                                       x_header_scredit_tbl        => l_out_header_scredit_table_u,
+                                                                       x_header_scredit_val_tbl    => l_out_header_scredit_val_tab_u,
+                                                                       x_line_tbl                  => l_out_line_table_u,
+                                                                       x_line_val_tbl              => l_out_line_val_table_u,
+                                                                       x_line_adj_tbl              => l_out_line_adj_table_u,
+                                                                       x_line_adj_val_tbl          => l_out_line_adj_val_table_u,
+                                                                       x_line_price_att_tbl        => l_out_line_price_att_table_u,
+                                                                       x_line_adj_att_tbl          => l_out_line_adj_att_table_u,
+                                                                       x_line_adj_assoc_tbl        => l_out_line_adj_assoc_table_u,
+                                                                       x_line_scredit_tbl          => l_out_line_scredit_table_u,
+                                                                       x_line_scredit_val_tbl      => l_out_line_scredit_val_table_u,
+                                                                       x_lot_serial_tbl            => l_out_lot_serial_table_u,
+                                                                       x_lot_serial_val_tbl        => l_out_lot_serial_val_table_u,
+                                                                       x_action_request_tbl        => l_out_action_request_table_u);
+                                          Fnd_File.put_line (Fnd_File.LOG,'l_return_status_u : ' || l_return_status_u);
+                                          Fnd_File.put_line (Fnd_File.LOG,'l_header_id : ' || l_header_rec_u.header_id);
+                                          Fnd_File.put_line (Fnd_File.LOG,'l_msg_count_u : ' || l_msg_count_u);
+                                          --Fnd_File.put_line (Fnd_File.LOG,'l_msg_data_u : ' || l_msg_data_u);
+                                          IF l_return_status_u != 'S'
+                                          THEN
+                                            l_status1 := 'INVALID';
+                                            IF l_msg_count_u > 0 THEN
+                                               FOR l_index in 1..l_msg_count_u LOOP
+                                                   fnd_msg_pub.get(p_msg_index => l_index, p_encoded => FND_API.G_FALSE, p_data => l_msg_data_u, p_msg_index_out => l_msg_index_out);
+                                                   Fnd_File.put_line (Fnd_File.LOG,l_msg_data_u);
+                                            END LOOP;
+                                            END IF;
+                                          END IF;
+                                          IF l_return_status_u = FND_API.G_RET_STS_SUCCESS THEN
+                                            l_status1 := 'VALID';
+                                            IF l_msg_count_u > 0 THEN
+                                                FOR l_index in 1..l_msg_count_u loop
+                                                    fnd_msg_pub.get(p_msg_index => l_index, p_encoded => FND_API.G_FALSE, p_data => l_msg_data_u, p_msg_index_out => l_msg_index_out);
+                                                    Fnd_File.put_line (Fnd_File.LOG,l_msg_data_u);
+                                                END LOOP;
+                                            END IF;
+                                            Fnd_File.put_line (Fnd_File.LOG,'PROCEDURE COMPLETED SUCCESFULLY ... ');
+                                            COMMIT;
+                                          END IF;
+                         /*                 IF l_return_status_u != FND_API.G_RET_STS_SUCCESS THEN
+                                            --ROLLBACK;
+                                            --xx_emf_pkg.error (p_severity                 => xx_emf_cn_pkg.cn_low,
+                                            --                  p_category                 => xx_emf_cn_pkg.cn_tech_error,
+                                            --                  p_error_text               =>  l_msg_data_u,
+                                            --                  p_record_identifier_1      => cur_line_data_rec.ordered_item
+                                            --                  );
+                                            --Fnd_File.put_line (Fnd_File.LOG,'AFTER ERROR IN ORDER API ... ');
+                                            Fnd_File.put_line (Fnd_File.LOG, 'Inside email notification' );
+                                            l_emailID := fnd_profile.value('FTL: INTER-ORG TRANSACTION AND ISO MISMATCH NOTIFICATION');
+                                            l_req_id := NULL;
+                                            l_req_id := fnd_request.submit_request
+                                                        (
+                                                        application      => 'FTLONT'
+                                                       ,program          => 'FTL_SEND_CSR_EMAIL'
+                                                       ,description      => 'I-259'
+                                                       ,start_time       => TO_CHAR (SYSDATE)
+                                                       ,sub_request      => FALSE
+                                                       ,argument1        => 'Internal Sales Order  '||cur_header_stag_rec.Item_number ||' '||'Item Number  '||' '||
+                                                                            'Update failed for ISO:' || cur_line_data_rec.order_number
+                                                       ,argument2        => 'Action Required: FTL: INTER-ORG TRANSACTION AND ISO MISMATCH NOTIFICATION'
+                                                       ,argument3        => l_emailID
+                                                        );
+                                                        COMMIT;
+                                          END IF;
+                                          Fnd_File.put_line (Fnd_File.LOG,'AFTER COMMITING ORDER API ... '); */
+                        COMMIT;
+                ELSIF((l_interorg_qty * l_conv_fact) >= cur_line_data_rec.ordered_quantity)    THEN
+                        --
+                        l_qty := 0;
+                        l_interorg_qty := (l_interorg_qty * l_conv_fact) - cur_line_data_rec.ordered_quantity; -- Now l_interorg_qty is in OM UOM
+                        l_interorg_qty := l_interorg_qty / l_conv_fact; -- Now l_interorg_qty is in PKMS UOM
+                        --
+                        Fnd_File.put_line (Fnd_File.LOG, 'IO qty is greater than ISO qty ');
+                        Fnd_File.put_line (Fnd_File.LOG, 'cur_header_stag_rec.quantity'||abs(cur_header_stag_rec.quantity));
+                        Fnd_File.put_line (Fnd_File.LOG, ' cur_line_data_rec.ordered_quantity  '||cur_line_data_rec.ordered_quantity);
+                        fnd_file.put_line (Fnd_File.LOG,'Item_number'||cur_header_stag_rec.Item_number);
+                        Fnd_File.put_line (Fnd_File.LOG,'from_organization_id'||cur_header_stag_rec.from_organization_id);
+                        Fnd_File.put_line (Fnd_File.LOG,'to_organization_id'||cur_header_stag_rec.to_organization_id);
+                              -- CANCEL Line --
+                        l_line_tbl (l_count)                      := oe_order_pub.g_miss_line_rec;
+                        l_line_tbl (l_count).operation            := OE_GLOBALS.G_OPR_UPDATE;
+                        l_line_tbl (l_count).header_id            := cur_line_data_rec.HEADER_ID;--265551;
+                        l_line_tbl (l_count).line_id              := cur_line_data_rec.line_id;--210392;--;
+                        l_line_tbl (l_count).ordered_quantity     := l_qty;--0;
+                        l_line_tbl (l_count).change_reason        := 'Not provided';
+                        l_line_tbl (l_count).cancelled_flag       := 'Y';
+                        Fnd_File.put_line (Fnd_File.LOG,'Starting of API');
+                        Fnd_File.put_line (Fnd_File.LOG, ' cur_line_data_rec.HEADER_ID  '||cur_line_data_rec.HEADER_ID);
+                        Fnd_File.put_line (Fnd_File.LOG, ' cur_line_data_rec.LINE_ID  '||cur_line_data_rec.LINE_ID);
+                        Fnd_File.put_line (Fnd_File.LOG, ' cur_line_data_rec.line_type_id  '||cur_line_data_rec.line_type_id);
+                        Fnd_File.put_line (Fnd_File.LOG, ' cur_line_data_rec.ship_from_org_id  '||cur_line_data_rec.ship_from_org_id);
+                        Fnd_File.put_line (Fnd_File.LOG, ' cur_line_data_rec.inventory_item_id '||cur_line_data_rec.inventory_item_id);
+                        Fnd_File.put_line (Fnd_File.LOG, ' cur_line_data_rec.order_quantity_uom '||cur_line_data_rec.order_quantity_uom);
+                        -- CALLING THE API TO CANCEL AN ORDER --
+                        OE_ORDER_PUB.PROCESS_ORDER (p_api_version_number          => l_api_version_number,
+                                p_header_rec                  => l_header_rec,
+                                p_line_tbl                    => l_line_tbl,
+                                p_action_request_tbl          => l_action_request_tbl,
+                                p_line_adj_tbl                => l_line_adj_tbl,
+                                -- OUT variables
+                                x_header_rec                  => l_header_rec_out,
+                                x_header_val_rec              => l_header_val_rec_out,
+                                x_header_adj_tbl              => l_header_adj_tbl_out,
+                                x_header_adj_val_tbl          => l_header_adj_val_tbl_out,
+                                x_header_price_att_tbl        => l_header_price_att_tbl_out,
+                                x_header_adj_att_tbl          => l_header_adj_att_tbl_out,
+                                x_header_adj_assoc_tbl        => l_header_adj_assoc_tbl_out,
+                                x_header_scredit_tbl          => l_header_scredit_tbl_out,
+                                x_header_scredit_val_tbl      => l_header_scredit_val_tbl_out,
+                                x_line_tbl                    => l_line_tbl_out,
+                                x_line_val_tbl                => l_line_val_tbl_out,
+                                x_line_adj_tbl                => l_line_adj_tbl_out,
+                                x_line_adj_val_tbl            => l_line_adj_val_tbl_out,
+                                x_line_price_att_tbl          => l_line_price_att_tbl_out,
+                                x_line_adj_att_tbl            => l_line_adj_att_tbl_out,
+                                x_line_adj_assoc_tbl          => l_line_adj_assoc_tbl_out,
+                                x_line_scredit_tbl            => l_line_scredit_tbl_out,
+                                x_line_scredit_val_tbl        => l_line_scredit_val_tbl_out,
+                                x_lot_serial_tbl              => l_lot_serial_tbl_out,
+                                x_lot_serial_val_tbl          => l_lot_serial_val_tbl_out,
+                                x_action_request_tbl          => l_action_request_tbl_out,
+                                x_return_status               => l_return_status,
+                                x_msg_count                   => l_msg_count,
+                                x_msg_data                    => l_msg_data
+                                );
+                    Fnd_File.put_line (Fnd_File.LOG,'Completion of API');
+                    Fnd_File.put_line (Fnd_File.LOG,'l_return_status : ' || l_return_status);
+                    --
+                    IF l_return_status = fnd_api.g_ret_sts_success  THEN
+                    COMMIT;
+                    ELSE
+                      Fnd_File.put_line (Fnd_File.LOG,'Order Cancellation failed:'||l_msg_data);
+                      --ROLLBACK;
+                      --UPDATE FTL_MTL_TRANSACTION_STG
+                      --SET PROCESS_CODE = 'ERROR',
+                      --request_id = fnd_global.conc_request_id
+                      --WHERE process_code = xx_emf_cn_pkg.cn_postval
+                      --AND item_number = cur_header_stag_rec.item_number;
+                      --COMMIT;
+                      --xx_emf_pkg.error( p_severity                 => xx_emf_cn_pkg.cn_low,
+                      --                  p_category                 => xx_emf_cn_pkg.cn_tech_error,
+                      --                  p_error_text               => 'Error while cancelling the order = '|| l_msg_data,
+                      --                  p_record_identifier_1      => cur_header_stag_rec.item_number
+                      --                  );
+                      FOR i IN 1 .. l_msg_count
+                      LOOP
+                          l_msg_data := oe_msg_pub.get( p_msg_index => i, p_encoded => 'F');
+                          Fnd_File.put_line (Fnd_File.LOG, 'l_msg_data ='|| l_msg_data);
+                      END LOOP;
+                      --
+                   /*        Fnd_File.put_line (Fnd_File.LOG, 'Inside email notification' );
+                           l_emailID := fnd_profile.value('FTL: INTER-ORG TRANSACTION AND ISO MISMATCH NOTIFICATION');
+                           l_req_id := NULL;
+                           l_req_id := fnd_request.submit_request( application      => 'FTLONT'
+                                              ,program          => 'FTL_SEND_CSR_EMAIL'
+                                              ,description      => 'I-259'
+                                              ,start_time       => TO_CHAR (SYSDATE)
+                                              ,sub_request      => FALSE
+                                              ,argument1        => 'Internal Sales Order  '||cur_header_stag_rec.Item_number ||' '||'Item Number  '||' '||
+                                                                   'Update failed for ISO:' || cur_line_data_rec.order_number
+                                              ,argument2        => 'Action Required: FTL: INTER-ORG TRANSACTION AND ISO MISMATCH NOTIFICATION'
+                                              ,argument3        => l_emailID
+                                              );
+                           COMMIT;
+                      -- */
+                    END IF;
+                END IF;
+
+                IF(l_interorg_qty = 0)    THEN
+                   EXIT;
+                END IF;
+
+             END LOOP; ----end of line loop
+             ------------------------------------------------------------------
+           /*  IF l_var = 'N' THEN
+                 --email notification
+                 BEGIN
+                           Fnd_File.put_line (Fnd_File.LOG, 'Inside email notification' );
+                           l_emailID := fnd_profile.value('FTL: INTER-ORG TRANSACTION AND ISO MISMATCH NOTIFICATION');
+                           l_req_id := NULL;
+                           l_req_id := fnd_request.submit_request( application      => 'FTLONT'
+                                              ,program          => 'FTL_SEND_CSR_EMAIL'
+                                              ,description      => 'I-259'
+                                              ,start_time       => TO_CHAR (SYSDATE)
+                                              ,sub_request      => FALSE
+                                              ,argument1        => 'Internal Sales Order  '||cur_header_stag_rec.Item_number ||' '||'Item Number  '||' '||
+                                                                   'does not have ISO'
+                                              ,argument2        => 'Action Required: FTL: INTER-ORG TRANSACTION AND ISO MISMATCH NOTIFICATION'
+                                              ,argument3        => l_emailID
+                                              );
+                        COMMIT;
+                        IF l_req_id = 0
+                          THEN
+                              xx_emf_pkg.write_log(xx_emf_cn_pkg.cn_high,'Error in submitting the FTL:ISO MISMATCH NOTIFICATION program'||SQLERRM);
+                          ELSE
+                              xx_emf_pkg.write_log(xx_emf_cn_pkg.cn_high,'FTL: ISO MISMATCH NOTIFICATION program submitted successfully');
+                              l_wait_request := fnd_concurrent.wait_for_request(request_id        => l_req_id,
+                                                                                interval          => 10,
+                                                                                max_wait          => 2000,
+                                                                                phase             => l_phase,
+                                                                                status            => l_status,
+                                                                                dev_phase         => l_dev_phase,
+                                                                                dev_status        => l_dev_status,
+                                                                                MESSAGE           => l_message
+                                                                                );
+                               IF l_dev_phase = 'COMPLETE' AND l_dev_status = 'NORMAL'
+                               THEN
+                                   xx_emf_pkg.write_log(xx_emf_cn_pkg.cn_high,'FTL: INTER-ORG TRANSACTION AND ISO MISMATCH NOTIFICATION Program Completed - Successfully');
+                               ELSE
+                                   xx_emf_pkg.write_log(xx_emf_cn_pkg.cn_high,'FTL: INTER-ORG TRANSACTION AND ISO MISMATCH NOTIFICATION Program Completed - Failed');
+                               END IF;
+                        END IF;
+                 EXCEPTION
+                 WHEN OTHERS
+                            THEN
+                                xx_emf_pkg.error (p_severity                 => xx_emf_cn_pkg.cn_low,
+                                                  p_category                 => xx_emf_cn_pkg.cn_process_data,
+                                                  p_error_text               => 'Error while submitting FTL: INTER-ORG TRANSACTION AND ISO MISMATCH NOTIFICATION program',
+                                                  p_record_identifier_1      => cur_header_stag_rec.Item_number
+                                                 );
+                 END;
+             END IF; */
+             ----------------END email notification --
+     END LOOP; ----end of header loop
+EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+          UPDATE FTL_MTL_TRANSACTION_STG
+          SET PROCESS_CODE = 'ERROR'
+          WHERE PROCESS_CODE = xx_emf_cn_pkg.cn_postval
+                     AND request_id = xx_emf_pkg.g_request_id;
+          COMMIT;
+            xx_emf_pkg.error(p_severity                 => xx_emf_cn_pkg.cn_low,
+                             p_category                 => xx_emf_cn_pkg.cn_process_data,
+                             p_error_text               => 'No Data found'||SQLERRM,
+                             p_record_identifier_1      => NULL
+                            );
+    WHEN TOO_MANY_ROWS
+          THEN
+          UPDATE FTL_MTL_TRANSACTION_STG
+          SET PROCESS_CODE = 'ERROR'
+          WHERE PROCESS_CODE = xx_emf_cn_pkg.cn_postval
+          AND request_id = xx_emf_pkg.g_request_id;
+          COMMIT;
+            xx_emf_pkg.error(p_severity                 => xx_emf_cn_pkg.cn_low,
+                             p_category                 => xx_emf_cn_pkg.cn_process_data,
+                             p_error_text               => 'Too Many rows'||SQLERRM,
+                             p_record_identifier_1      => NULL
+                            );
+   WHEN OTHERS
+          THEN
+          UPDATE FTL_MTL_TRANSACTION_STG
+          SET PROCESS_CODE = 'ERROR'
+          WHERE PROCESS_CODE = xx_emf_cn_pkg.cn_postval
+          AND request_id = xx_emf_pkg.g_request_id;
+          COMMIT;
+            xx_emf_pkg.error(p_severity                 => xx_emf_cn_pkg.cn_low,
+                             p_category                 => xx_emf_cn_pkg.cn_process_data,
+                             p_error_text               => 'When Others'||SQLERRM,
+                             p_record_identifier_1      => NULL
+                            );
+END CHECK_QUANTITY;
+   --------------------------------------------------------------------------
+-------------------------------------------------------------------------
+-----------< process_data >----------------------------------------------
+-------------------------------------------------------------------------
+   PROCEDURE process_data
+   IS
+      l_msg                       VARCHAR2 (2000);
+      l_error_code                NUMBER                  := xx_emf_cn_pkg.cn_success;
+      l_sqlerrm                   VARCHAR2 (2000);
+      c_process_flag     CONSTANT VARCHAR2 (1)          := 'Y';
+      c_process_status   CONSTANT VARCHAR2 (1)          := 'P';
+      TYPE p_tbl_ftl_mtl_transaction_stg IS TABLE OF ftl_cust.ftl_mtl_transaction_stg%ROWTYPE
+         INDEX BY PLS_INTEGER;
+      l_creation_date                          DATE     := SYSDATE;
+      l_created_by                             NUMBER   := fnd_global.user_id;
+      l_last_update_date                       DATE     := SYSDATE;
+      l_last_updated_by                        NUMBER   := fnd_global.user_id;
+      l_last_update_login                      NUMBER   := fnd_profile.VALUE (xx_emf_cn_pkg.cn_login_id);
+      l_prog_appl_id                           NUMBER   := fnd_global.prog_appl_id;
+      l_program_id                             NUMBER   := fnd_global.conc_program_id;
+      l_request_id                                NUMBER   := FND_PROFILE.VALUE('CONC_REQUEST_ID');
+      l_array_hdr0                p_tbl_ftl_mtl_transaction_stg;
+      l_array_hdr1                p_tbl_ftl_mtl_transaction_stg;
+      l_idx                       NUMBER;
+      l_limit_rows                NUMBER                := 5000;
+      l_error_count               NUMBER;
+      l_insert_count              NUMBER;
+      l_errno                     NUMBER;
+      l_rowid                     VARCHAR2(50);
+      l_shipment_num              VARCHAR2(50);
+      l_item_number               VARCHAR2(50);
+      l_reference                 VARCHAR2(240);
+      l_errm                      VARCHAR2(1000);
+      l_primary_UOM_code          VARCHAR2(3);
+      l_conv_fact                 NUMBER := 1;
+      l_insert_txn                BOOLEAN;
+	  l_intransit_type			  VARCHAR2(10); --Added for Auto-Receive for SHX
+	  l_to_subinv				  VARCHAR2(50); --Added for Auto-Receive for SHX
+	  l_timezone         VARCHAR2(50); -- Added for Timezone modification on transaction_date SR00453359
+      l_transaction_Date DATE;         -- Added for Timezone modification on transaction_date SR00453359
+	  l_receipt_Date	 DATE;         -- Added for Timezone modification on transaction_date SR00453359
+	  l_timezone_r       VARCHAR2(50); -- Added for Timezone modification on transaction_date SR00453359
+
+      CURSOR cr_ftl_mtl_transaction_stg
+      IS
+         SELECT *
+           FROM ftl_cust.ftl_mtl_transaction_stg
+          WHERE ERROR_CODE IN
+                        (xx_emf_cn_pkg.cn_success, xx_emf_cn_pkg.cn_rec_warn)
+            AND process_code = xx_emf_cn_pkg.cn_postval
+            AND request_id = xx_emf_pkg.g_request_id
+                       --Condition added as part of ink throwers AMSEBS-962,978
+            AND to_organization NOT IN(SELECT a.organization_code
+					        FROM mtl_parameters a, ftl_lookup_values b
+					       WHERE a.organization_code = b.meaning
+					         AND b.lookup_type = 'FTL_3PL_ORGANIZATIONS'
+					         AND b.enabled_flag = 'Y');
+    BEGIN
+            xx_emf_pkg.write_log (xx_emf_cn_pkg.cn_low,'Inside Process Data');
+fnd_file.put_line (fnd_file.log, 'step 3.2');
+          OPEN cr_ftl_mtl_transaction_stg;
+          LOOP
+          EXIT WHEN cr_ftl_mtl_transaction_stg%NOTFOUND;
+fnd_file.put_line (fnd_file.log, 'step 3.3');
+          l_array_hdr1 := l_array_hdr0;
+fnd_file.put_line (fnd_file.log, 'step 3.4');
+             FETCH cr_ftl_mtl_transaction_stg
+             BULK COLLECT INTO l_array_hdr1 LIMIT l_limit_rows;
+fnd_file.put_line (fnd_file.log, 'step 3.5');
+                FOR z IN 1 .. l_array_hdr1.COUNT
+                LOOP
+fnd_file.put_line (fnd_file.log, 'step 3.6');
+                    l_insert_txn := TRUE;
+                    l_conv_fact  := 1;
+                    xx_emf_pkg.write_log (xx_emf_cn_pkg.cn_low,'Insert the records in Interface table');
+                    --
+                    l_reference := l_array_hdr1(z).reference;  ---case_number || '.' || l_array_hdr1(z).pallet_number;
+fnd_file.put_line (fnd_file.log, 'step 3.7');
+                    --
+                    -- Find primary UOM and if transaction UOM is different then convert qty to primary UOM
+                    BEGIN
+                       SELECT primary_uom_code
+                         INTO l_primary_UOM_code
+                         FROM mtl_system_items_b
+                        WHERE inventory_item_id = l_array_hdr1(z).item_id
+                          AND organization_id   = l_array_hdr1(z).from_organization_id;
+                    EXCEPTION
+                       WHEN OTHERS THEN
+                          l_errm := SQLERRM;
+                          fnd_file.put_line (fnd_file.log, 'Failed at step 3.8 : ' || l_errm);
+                          l_insert_txn := FALSE;
+                    END;
+                    --
+                    IF (l_array_hdr1(z).uom != l_primary_UOM_code) THEN
+                       l_conv_fact := inv_convert.inv_um_convert
+                                      (
+                                       p_item_id          => 0,
+                                       p_from_uom_code    => l_array_hdr1(z).uom,
+                                       p_to_uom_code      => l_primary_UOM_code
+                                      );
+                       IF (l_conv_fact <= 0) THEN
+                          fnd_file.put_line (fnd_file.log, 'Failed at step 3.9 : Convertion factor from : ' || l_array_hdr1(z).uom || ' to : ' || l_primary_UOM_code || ' undefined.');
+                          l_insert_txn := FALSE;
+                       ELSE
+                          l_reference := SUBSTR((l_reference || ' :SRC_QTY = ' || ABS(l_array_hdr1(z).quantity) || ' :SRC_UOM = ' || l_array_hdr1(z).uom), 1, 240);
+                       END IF;
+                    ELSE
+                       l_conv_fact := 1;
+                    END IF;
+                    --
+                    --
+					--Added for Auto-Receive for SHX
+					BEGIN
+						SELECT INTRANSIT_TYPE
+							INTO l_intransit_type
+						FROM MTL_SHIPPING_NETWORK_VIEW
+							WHERE FROM_ORGANIZATION_ID = l_array_hdr1(z).from_organization_id
+							AND TO_ORGANIZATION_ID     = l_array_hdr1(z).to_organization_id ;
+					EXCEPTION
+						WHEN OTHERS
+						THEN
+							l_intransit_type := 0 ;
+					END;
+
+					IF l_intransit_type = '1' THEN
+					 l_to_subinv := l_array_hdr1(z).TO_SUBINVENTORY ;
+					ELSE
+					 l_to_subinv := NULL;
+					END IF;
+					--End of change for Auto-Receive for SHX
+
+					--Added for Timezone modification on transaction_date SR00453359
+					fnd_file.put_line (fnd_file.log, 'Timezone modification Starts' || ' ' ||TO_CHAR(sysdate, 'dd-mon-yyyy hh24:mi:ss'));
+					BEGIN
+						SELECT timezone_code
+						INTO l_timezone
+						FROM hr_locations_v hlv,
+						hr_organization_units_v houv
+						WHERE houv.organization_id = l_array_hdr1(z).from_organization_id
+						AND houv.location_id       = hlv.location_id;
+					EXCEPTION
+					WHEN OTHERS THEN
+						l_errm := SQLERRM;
+						fnd_file.put_line (fnd_file.log, 'Failed in fetching Timezone for Org: '|| l_array_hdr1(z).from_organization || l_errm);
+					END;
+					IF l_timezone        IS NULL THEN
+						l_transaction_Date := l_array_hdr1(z).transaction_date;
+					ELSE
+						-- l_transaction_Date := NEW_TIME(TO_DATE(l_array_hdr1(z).transaction_date, 'DD-MON-YYYY HH24:MI:SS'), l_timezone, 'CST');
+						l_transaction_Date := CAST (from_tz(CAST (l_array_hdr1(z).transaction_date AS TIMESTAMP),l_timezone) at TIME zone 'America/Chicago' AS DATE);
+					END IF;
+					fnd_file.put_line (fnd_file.log, 'Timezone modification Ends' || ' ' ||TO_CHAR(sysdate, 'dd-mon-yyyy hh24:mi:ss'));
+					fnd_file.put_line (fnd_file.log, 'Transaction Date := ' ||TO_CHAR(l_transaction_Date,'dd-mon-yyyy hh24:mi:ss'));
+					--End of Timezone modification on transaction_date SR00453359
+
+
+
+					--Added for Timezone modification on expected_receipt_date SR00453359
+					fnd_file.put_line (fnd_file.log, 'Timezone modification Starts' || ' ' ||TO_CHAR(sysdate, 'dd-mon-yyyy hh24:mi:ss'));
+					BEGIN
+						SELECT timezone_code
+						INTO l_timezone_r
+						FROM hr_locations_v hlv,
+						hr_organization_units_v houv
+						WHERE houv.organization_id = l_array_hdr1(z).from_organization_id
+						AND houv.location_id       = hlv.location_id;
+					EXCEPTION
+					WHEN OTHERS THEN
+						l_errm := SQLERRM;
+						fnd_file.put_line (fnd_file.log, 'Failed in fetching Timezone for Org: '|| l_array_hdr1(z).from_organization || l_errm);
+					END;
+					IF l_timezone_r        IS NULL THEN
+						l_receipt_Date := l_array_hdr1(z).expected_receipt_date;
+					ELSE
+						-- l_transaction_Date := NEW_TIME(TO_DATE(l_array_hdr1(z).transaction_date, 'DD-MON-YYYY HH24:MI:SS'), l_timezone, 'CST');
+						l_receipt_Date := CAST (from_tz(CAST (l_array_hdr1(z).expected_receipt_date AS TIMESTAMP),l_timezone_r) at TIME zone 'America/Chicago' AS DATE);
+					END IF;
+					fnd_file.put_line (fnd_file.log, 'Timezone modification Ends' || ' ' ||TO_CHAR(sysdate, 'dd-mon-yyyy hh24:mi:ss'));
+					fnd_file.put_line (fnd_file.log, 'Transaction Date := ' ||TO_CHAR(l_receipt_Date,'dd-mon-yyyy hh24:mi:ss'));
+					--End of Timezone modification on expected_receipt_date SR00453359
+
+
+                    IF (l_insert_txn = TRUE) THEN
+                       INSERT INTO mtl_transactions_interface
+                                (SOURCE_CODE,
+                                 SOURCE_LINE_ID,
+                                 SOURCE_HEADER_ID,
+                                 PROCESS_FLAG,
+                                 TRANSACTION_MODE,
+                                 CREATION_DATE,
+                                 CREATED_BY,
+                                 LAST_UPDATED_BY,
+                                 LAST_UPDATE_DATE,
+                                 LAST_UPDATE_LOGIN,
+                                 INVENTORY_ITEM_ID,
+                                 ORGANIZATION_ID,
+                                 TRANSACTION_QUANTITY,
+                                 TRANSACTION_UOM,
+                                 TRANSACTION_DATE,
+                                 SUBINVENTORY_CODE,
+                                 TRANSACTION_TYPE_ID,
+                                 TRANSACTION_REFERENCE,
+								 TRANSFER_SUBINVENTORY,  --Added for Auto-Receive for SHX
+                                 TRANSFER_ORGANIZATION,
+                                 SHIPMENT_NUMBER,
+                                 FREIGHT_CODE,
+                                 CONTAINERS,
+                                 WAYBILL_AIRBILL,
+                                 EXPECTED_ARRIVAL_DATE,
+                                 REASON_ID)
+                       VALUES    (
+                                 0,
+                                 0,
+                                 0,
+                                 1,
+                                 3,
+                                 sysdate,
+                                l_created_by,
+                                l_array_hdr1(z).last_updated_by,
+                                l_last_update_date,                                              -- l_array_hdr1(z).last_update_date,
+                                l_last_updated_by,                                               --l_array_hdr1(z).last_update_login,
+                                l_array_hdr1(z).item_id,
+                                l_array_hdr1(z).from_organization_id,
+                                ABS(l_array_hdr1(z).quantity) * -1 * l_conv_fact,                -- changed on 16-Dec-2013 -- added conv. fact on 29-Mar-2014
+                                l_primary_UOM_code,                                              -- l_array_hdr1(z).uom,
+                                --l_array_hdr1(z).transaction_date, 				-- Commented for Timezone change on transaction date
+								l_transaction_Date,                               	-- modified for Timezone change on transaction date --l_array_hdr1(z).transaction_date,
+                                l_array_hdr1(z).subinventory,
+                                l_array_hdr1(z).transaction_type_id,
+                                l_reference, -- reference,
+								l_to_subinv, --Added for Auto-Receive for SHX
+                                l_array_hdr1(z).to_organization_id,
+                                l_array_hdr1(z).shipment_number,
+                                l_array_hdr1(z).freight,
+                                l_array_hdr1(z).containers,
+                                l_array_hdr1(z).waybill_air_bill,
+                                --l_array_hdr1(z).expected_receipt_date,			-- Commented for Timezone change on transaction date
+								l_receipt_Date,									-- modified for Timezone change on transaction date 
+                                l_array_hdr1(z).reason_id
+                                );
+                    END IF; -- l_insert_txn = TRUE
+fnd_file.put_line (fnd_file.log, 'step 3.8');
+                END LOOP;
+                xx_emf_pkg.write_log (xx_emf_cn_pkg.cn_low,'After the insert in interface table');
+                l_array_hdr1.DELETE;
+fnd_file.put_line (fnd_file.log, 'step 3.9');
+          END LOOP;
+    IF cr_ftl_mtl_transaction_stg%ISOPEN
+    THEN
+        CLOSE cr_ftl_mtl_transaction_stg;
+    END IF;
+fnd_file.put_line (fnd_file.log, 'step 3.9.1');
+    COMMIT;
+    EXCEPTION
+       WHEN OTHERS
+       THEN
+          l_errm := SQLERRM;
+          fnd_file.put_line (fnd_file.log, 'step 3.7 error : ' || l_errm);
+          --
+          l_error_count := SQL%BULK_EXCEPTIONS.COUNT;
+          FOR i IN 1 .. l_error_count
+          LOOP
+             l_errno := SQL%BULK_EXCEPTIONS (i).ERROR_CODE;
+             l_msg := SQLERRM (-l_errno);
+             l_idx := SQL%BULK_EXCEPTIONS (i).ERROR_INDEX;
+             l_error_code := xx_emf_cn_pkg.cn_rec_err;
+             xx_emf_pkg.error
+                (p_severity                 => xx_emf_cn_pkg.cn_low,
+                 p_category                 => xx_emf_cn_pkg.cn_valid,
+                 p_error_text               =>    l_msg
+                                               || l_array_hdr1(l_idx).shipment_number||'-'||l_array_hdr1(l_idx).item_number,
+                 p_record_identifier_1      => l_array_hdr1(l_idx).shipment_number||'-'||l_array_hdr1(l_idx).item_number
+                );
+          END LOOP;
+          l_errno := SQLCODE;
+          l_msg := SQLERRM ;
+          l_error_code := xx_emf_cn_pkg.cn_rec_err;
+          xx_emf_pkg.error
+             (p_severity                 => xx_emf_cn_pkg.cn_low,
+              p_category                 => xx_emf_cn_pkg.cn_valid,
+              p_error_text               => l_msg,
+              p_record_identifier_1      => l_array_hdr1(l_idx).shipment_number||'-'||l_array_hdr1(l_idx).item_number
+             );
+          ROLLBACK;
+    END process_data;
+-------------------------------------------------------------------------
+-----------< update_record_count >---------------------------------------
+-------------------------------------------------------------------------
+   PROCEDURE update_record_count (p_err_cnt IN OUT NUMBER)
+   IS
+      CURSOR cr_get_total_cnt
+      IS
+         SELECT COUNT (1) total_count
+           FROM ftl_cust.ftl_mtl_transaction_stg
+          WHERE request_id = xx_emf_pkg.g_request_id;
+      l_total_cnt     NUMBER;
+      CURSOR cr_get_error_cnt
+      IS
+         SELECT COUNT (1) error_count
+           FROM ftl_cust.ftl_mtl_transaction_stg
+          WHERE request_id = xx_emf_pkg.g_request_id
+            AND ERROR_CODE = xx_emf_cn_pkg.cn_rec_err;
+      l_error_cnt     NUMBER;
+      CURSOR cr_get_warning_cnt
+      IS
+         SELECT COUNT (1) warn_count
+           FROM ftl_cust.ftl_mtl_transaction_stg
+          WHERE request_id = xx_emf_pkg.g_request_id
+            AND ERROR_CODE = xx_emf_cn_pkg.cn_rec_warn;
+      l_warn_cnt      NUMBER;
+      l_validate      NUMBER;
+      CURSOR cr_get_success_cnt
+      IS
+         SELECT COUNT (1) success_count
+           FROM ftl_cust.ftl_mtl_transaction_stg
+          WHERE request_id = xx_emf_pkg.g_request_id
+            AND process_code = xx_emf_cn_pkg.cn_process_data
+            AND ERROR_CODE = xx_emf_cn_pkg.cn_success;
+      l_success_cnt   NUMBER;
+   BEGIN
+      OPEN cr_get_total_cnt;
+      FETCH cr_get_total_cnt
+       INTO l_total_cnt;
+      CLOSE cr_get_total_cnt;
+      OPEN cr_get_error_cnt;
+      FETCH cr_get_error_cnt
+       INTO l_error_cnt;
+      CLOSE cr_get_error_cnt;
+      OPEN cr_get_warning_cnt;
+      FETCH cr_get_warning_cnt
+       INTO l_warn_cnt;
+      CLOSE cr_get_warning_cnt;
+      OPEN cr_get_success_cnt;
+      FETCH cr_get_success_cnt
+       INTO l_success_cnt;
+      CLOSE cr_get_success_cnt;
+      p_err_cnt := l_error_cnt;
+      xx_emf_pkg.update_recs_cnt (p_total_recs_cnt        => l_total_cnt,
+                                  p_success_recs_cnt      => l_success_cnt,
+                                  p_warning_recs_cnt      => l_warn_cnt,
+                                  p_error_recs_cnt        => l_error_cnt
+                                 );
+   END update_record_count;
+--------------------------------------------------------------------------------
+------------------< set_stage >-------------------------------------------------
+--------------------------------------------------------------------------------
+   PROCEDURE set_stage (p_stage VARCHAR2)
+   IS
+   BEGIN
+      g_stage := p_stage;
+   END set_stage;
+--------------------------------------------------------------------------------
+------------------< update_staging_records >------------------------------------
+--------------------------------------------------------------------------------
+	-- Commented and added for MFG 2.1 Org wise run
+   --PROCEDURE update_staging_records (p_error_code VARCHAR2)
+   PROCEDURE update_staging_records (p_error_code VARCHAR2, p_org_code VARCHAR2)
+   IS
+      l_last_update_date    DATE   := SYSDATE;
+      l_last_updated_by     NUMBER := fnd_global.user_id;
+      l_last_update_login   NUMBER
+                             := fnd_profile.VALUE (xx_emf_cn_pkg.cn_login_id);
+      PRAGMA AUTONOMOUS_TRANSACTION;
+   BEGIN
+      UPDATE ftl_cust.ftl_mtl_transaction_stg
+         SET process_code = g_stage,
+             ERROR_CODE = DECODE (ERROR_CODE, NULL, p_error_code, ERROR_CODE)
+       WHERE request_id = xx_emf_pkg.g_request_id
+         AND UPPER(process_code) = C_REC_NEW
+		 -- Added for MFG 2.1 Org wise run
+		 AND FROM_ORGANIZATION = p_org_code
+		 ;
+      COMMIT;
+   END update_staging_records;
+--------------------------------------------------------------------------------
+------------------< update_base_records  >------------------------------------
+--------------------------------------------------------------------------------
+   PROCEDURE update_base_records
+   IS
+      l_last_update_date    DATE   := SYSDATE;
+      l_last_updated_by     NUMBER := fnd_global.user_id;
+      l_last_update_login   NUMBER
+                             := fnd_profile.VALUE (xx_emf_cn_pkg.cn_login_id);
+      l_cnt                 NUMBER;
+      PRAGMA AUTONOMOUS_TRANSACTION;
+   BEGIN
+      xx_emf_pkg.write_log (xx_emf_cn_pkg.cn_low,
+                            'Inside update_base_records'
+                           );
+     UPDATE ftl_cust.ftl_mtl_transaction_stg
+         SET process_code = xx_emf_cn_pkg.cn_process_data,
+             ERROR_CODE = xx_emf_cn_pkg.cn_success
+       WHERE request_id = xx_emf_pkg.g_request_id
+         AND UPPER(process_code) = C_REC_NEW;
+      COMMIT;
+      xx_emf_pkg.write_log (xx_emf_cn_pkg.cn_low,
+                            'After update_base_records'
+                           );
+      EXCEPTION
+      WHEN OTHERS
+      THEN
+         fnd_file.put_line (fnd_file.LOG,
+                            'Exception is' || SQLERRM || SQLCODE
+                           );
+   END update_base_records;
+   -- END RESTRICTIONS
+ --------------------------------------------------------------------------------
+------------------< Main for Concurrent program call >---------------------------
+---------------------------------------------------------------------------------
+    PROCEDURE main_c (
+      errbuf            OUT NOCOPY      VARCHAR2,
+      retcode           OUT NOCOPY      VARCHAR2,
+      i_restart_flag    IN              VARCHAR2
+	  -- Added for MFG 2.1 Org wise run
+	  ,p_org_code VARCHAR2
+   )
+   IS
+   BEGIN
+    main (retcode,i_restart_flag
+    ,  p_org_code  -- Added for MFG 2.1 Org wise run
+    );
+   END main_c;
+--------------------------------------------------------------------------------
+------------------< Main for Direct call >--------------------------------------
+--------------------------------------------------------------------------------
+   PROCEDURE main (
+      retcode           OUT NOCOPY      VARCHAR2,
+      p_restart_flag    IN              VARCHAR2
+	  , p_org_code IN VARCHAR2 -- Added for MFG 2.1 Org wise run
+   )
+   IS
+      l_error_code            NUMBER      := xx_emf_cn_pkg.cn_success;
+      l_tbl_ftl_mtl_transaction_stg       tbl_ftl_mtl_transaction_stg;
+      l_person_id             NUMBER;
+      l_party_id              NUMBER;
+      l_parent_table          VARCHAR2 (40);
+      l_sqlerrm               VARCHAR2 (2000);
+      l_terminate_exception   EXCEPTION;
+      l_cnt                   NUMBER;
+      l_err_count             NUMBER             := 0;
+      l_Cntspace            NUMBER := 0;  --Added by Rajesh AMS to validate  for Shipment With Space(CR00015554)
+      l_err_cnt             NUMBER := 0 ; --Added below Code added as part of REQ000004388
+      -- CURSOR FOR VARIOUS STAGES
+	  -- Commented and added for MFG 2.1 Org wise run
+     -- CURSOR cr_ftl_mtl_tran_stg (p_process_status VARCHAR2)
+	  CURSOR cr_ftl_mtl_tran_stg (p_process_status VARCHAR2, p_org_code VARCHAR2)
+      IS
+         SELECT   *
+             FROM ftl_cust.ftl_mtl_transaction_stg
+            WHERE request_id = xx_emf_pkg.g_request_id
+              AND process_code = p_process_status
+              AND NVL (ERROR_CODE, xx_emf_cn_pkg.cn_success) IN
+                        (xx_emf_cn_pkg.cn_success, xx_emf_cn_pkg.cn_rec_warn)
+                        --Condition added as part of ink throwers AMSEBS-962,978
+              AND to_organization NOT IN(SELECT a.organization_code
+					        FROM mtl_parameters a, ftl_lookup_values b
+					       WHERE a.organization_code = b.meaning
+					         AND b.lookup_type = 'FTL_3PL_ORGANIZATIONS'
+					         AND b.enabled_flag = 'Y'
+							 -- Added for MFG 2.1 Org wise run
+							 AND FROM_ORGANIZATION = p_org_code)
+         ORDER BY shipment_number;
+
+--Added by Rajesh AMS to validate  for Shipment With Space(CR00015554)
+-- Added for MFG 2.1 Org wise run
+--CURSOR cur_dd
+CURSOR cur_dd (p_org_code VARCHAR2)
+  IS
+    SELECT COUNT (*),shipment_number
+    FROM ftl_cust.ftl_mtl_transaction_stg
+    WHERE  1=1
+    AND LENGTH(SHIPMENT_NUMBER)>LENGTH(trim(SHIPMENT_NUMBER))
+    AND request_id =xx_emf_pkg.g_request_id
+	-- Added for MFG 2.1 Org wise run
+	AND FROM_ORGANIZATION = p_org_code
+    GROUP BY shipment_number;
+  -- Added for MFG 2.1 Org wise run
+  --CURSOR cur_dv
+  CURSOR cur_dv (p_org_code VARCHAR2)
+  IS
+    SELECT distinct shipment_number
+    FROM ftl_cust.ftl_mtl_transaction_stg
+    WHERE 1=1
+    AND error_Code =1
+    AND request_id =xx_emf_pkg.g_request_id
+	-- Added for MFG 2.1 Org wise run
+	AND FROM_ORGANIZATION = p_org_code;
+
+    --End of Addition CR00015554
+
+   BEGIN
+      fnd_file.put_line (fnd_file.log, 'step 1' || to_char(sysdate, 'dd-mon-yyyy hh24:mi:ss'));
+      retcode := xx_emf_cn_pkg.cn_success;
+      -- G_MODULE := 'TCA_V2_API';
+      -- Set environment for EMF (Error Management Framework)
+      -- If you want the process to continue even after the emf env not being set
+      -- you must make p_required_flag from CN_YES to CN_NO
+      -- If you do not pass proper value then it will be considered as CN_YES
+      set_cnv_env (
+                   p_required_flag      => xx_emf_cn_pkg.cn_yes
+                  );
+      -- Inserting the record in staging table
+      --insert_stg_records(l_error_code);
+      -- include all the parameters to the conversion main here
+      -- as medium log messages
+      xx_emf_pkg.write_log (xx_emf_cn_pkg.cn_medium,
+                               'Starting main process'
+                            || CHR (13)
+                            || 'with the following parameters'
+                           );
+      xx_emf_pkg.write_log (xx_emf_cn_pkg.cn_medium,
+                            'Main:Param - p_restart_flag ' || p_restart_flag
+                           );
+      xx_emf_pkg.propagate_error (l_error_code);
+       --  l_error_code := move_rec_to_staging_table;
+       --  update_base_records;
+       --update_staging_records (xx_emf_cn_pkg.cn_success);
+         -- Add update_preint_tables
+         --xx_emf_pkg.propagate_error (l_error_code);
+      -- Call procedure to update records with the current request_id
+      -- So that we can process only those records
+      -- This gives a better handling of restartability
+      mark_records_for_processing (p_restart_flag       => p_restart_flag
+	  -- Added for MFG 2.1 Org wise run
+	  , p_org_code => p_org_code);
+  --Checking Shipment with Space (CR00015554)
+    BEGIN
+
+    FOR cur_rec IN cur_dd (p_org_code)
+    LOOP
+
+      UPDATE ftl_cust.ftl_mtl_transaction_stg
+      SET process_code='Data Validations',error_code  =1
+      WHERE shipment_number =cur_rec.shipment_number
+      AND request_id = xx_emf_pkg.g_request_id
+	  -- Added for MFG 2.1 Org wise run
+	  AND FROM_ORGANIZATION = p_org_code
+	  ;
+
+    END LOOP;
+    COMMIT;
+  END;
+  --Checking Shipment with Space (CR00015554)
+
+      -- Once the records are identified based on the input parameters
+      -- Start with pre-validations
+------------------------------------------------------
+----------( Stage 1: Pre Validations)-----------------
+------------------------------------------------------
+-- Set the stage to Pre Validations
+         set_stage (xx_emf_cn_pkg.cn_preval);
+         -- Change the validations package to the appropriate package name
+         -- Modify the parameters as required
+         -- DO NOT CHANGE ANYTHING ELSE IN THE CODE
+         -- PRE_VALIDATIONS SHOULD BE RETAINED
+         l_error_code := ftl_inv_intr_shipment_val.pre_validations ();
+         xx_emf_pkg.write_log (xx_emf_cn_pkg.cn_medium,
+                                  'After pre-validations l_ERROR_CODE '
+                               || l_error_code
+                              );
+         -- Update process code of staging records
+         -- Also move the successful records to pre-interface tables
+		 -- Commented and added for MFG 2.1 Org wise run
+        --update_staging_records (xx_emf_cn_pkg.cn_success);                 -----****----- marks it xx_emf_cn_pkg.cn_preval
+		update_staging_records (xx_emf_cn_pkg.cn_success, p_org_code);                 -----****----- marks it xx_emf_cn_pkg.cn_preval
+        xx_emf_pkg.propagate_error (l_error_code);
+         xx_emf_pkg.write_log (xx_emf_cn_pkg.cn_medium,
+                                  'After pre-validations l_ERROR_CODE '
+                               || l_error_code
+                              );
+-- Once pre-validations are complete the loop through the pre-interface records
+-- and perform data validations on this table
+-- Set the stage to data Validations
+   ------------------------------------------------------
+   ----------( Stage 2: Data Validations)----------------
+   ------------------------------------------------------
+      set_stage (xx_emf_cn_pkg.cn_valid);
+      xx_emf_pkg.write_log (xx_emf_cn_pkg.cn_low,
+                            'Stage-set_stage (xx_emf_cn_pkg.cn_valid)'
+                           );
+      xx_emf_pkg.write_log (xx_emf_cn_pkg.cn_low,
+                            'Stage-set_stage (xx_emf_cn_pkg.cn_valid)' ||xx_emf_cn_pkg.cn_preval
+                           );
+fnd_file.put_line (fnd_file.log, 'step 2'  || to_char(sysdate, 'dd-mon-yyyy hh24:mi:ss'));
+		-- Commented and added for MFG 2.1 Org wise run
+     -- OPEN cr_ftl_mtl_tran_stg (xx_emf_cn_pkg.cn_preval);
+	 OPEN cr_ftl_mtl_tran_stg (xx_emf_cn_pkg.cn_preval, p_org_code);
+      LOOP
+ fnd_file.put_line (fnd_file.log, 'step 2.01'  || to_char(sysdate, 'dd-mon-yyyy hh24:mi:ss'));
+         FETCH cr_ftl_mtl_tran_stg
+         BULK COLLECT INTO l_tbl_ftl_mtl_transaction_stg LIMIT xx_emf_cn_pkg.cn_bulk_collect;
+ fnd_file.put_line (fnd_file.log, 'step 2.02'  || to_char(sysdate, 'dd-mon-yyyy hh24:mi:ss'));
+        xx_emf_pkg.write_log (xx_emf_cn_pkg.cn_low,
+                            'cr_ftl_mtl_tran_stg' ||xx_emf_cn_pkg.cn_preval
+                           );
+         FOR i IN 1 .. l_tbl_ftl_mtl_transaction_stg.COUNT
+         LOOP
+          BEGIN
+             -- Perform header level Base App Validations
+			 -- Commented and added for MFG 2.1 Org wise run
+             --l_error_code := ftl_inv_intr_shipment_val.data_validations(l_tbl_ftl_mtl_transaction_stg (i));
+			 l_error_code := ftl_inv_intr_shipment_val.data_validations(l_tbl_ftl_mtl_transaction_stg (i), p_org_code);
+fnd_file.put_line (fnd_file.log, 'step 2.1'  || to_char(sysdate, 'dd-mon-yyyy hh24:mi:ss'));
+						--Code change as part of REQ000004388
+							BEGIN
+                            l_err_cnt := 0 ;
+								SELECT count(1) INTO l_err_cnt
+								 FROM FTL_MTL_TRANSACTION_STG 
+									WHERE SHIPMENT_NUMBER = l_tbl_ftl_mtl_transaction_stg (i).shipment_number 
+									AND ERROR_MSG is NOT NULL
+									AND PROCESS_CODE = 'Data Validations'
+									;
+
+							EXCEPTION WHEN OTHERS THEN
+								fnd_file.put_line (fnd_file.log, 'Exception in step 2.1 count'  || to_char(sysdate, 'dd-mon-yyyy hh24:mi:ss'));
+							END;
+
+							BEGIN
+							IF l_err_cnt > 0 THEN
+								UPDATE FTL_MTL_TRANSACTION_STG 
+									SET ERROR_MSG = 'This row NOT in Error, but at least one other row on this shipment IS in ERROR' 
+									WHERE SHIPMENT_NUMBER = l_tbl_ftl_mtl_transaction_stg (i).shipment_number 
+									AND ERROR_MSG is NULL
+									;
+								COMMIT;
+							END IF;	
+							EXCEPTION WHEN OTHERS THEN
+								fnd_file.put_line (fnd_file.log, 'Exception in step 2.1'  || to_char(sysdate, 'dd-mon-yyyy hh24:mi:ss'));
+							END;
+					--End of Code change as part of REQ000004388
+--fnd_file.put_line (fnd_file.log, 'step 2.2'  || to_char(sysdate, 'dd-mon-yyyy hh24:mi:ss' || 'ErrrorCode'||l_error_code));
+             xx_emf_pkg.propagate_error (l_error_code);
+          EXCEPTION
+             -- If HIGH error then it will be propagated to the next level
+             -- IF the process has to continue maintain it as a medium severity
+             WHEN xx_emf_pkg.g_e_rec_error
+             THEN
+                fnd_file.put_line (1,
+                                      ' In Exception 1:'
+                                   || SQLERRM
+                                  );
+                xx_emf_pkg.write_log
+                                 (xx_emf_cn_pkg.cn_low,
+                                  xx_emf_cn_pkg.cn_rec_err
+                                 );
+                l_tbl_ftl_mtl_transaction_stg(i).ERROR_CODE :=
+                                  xx_emf_cn_pkg.cn_rec_err;
+                xx_emf_pkg.error
+                   (p_severity                 => xx_emf_cn_pkg.cn_low,
+                    p_category                 => xx_emf_cn_pkg.cn_tech_error,
+                    p_error_text               =>    'Stage 2:Data Validation: g_e_rec_error=>'
+                                                  || SQLERRM,
+                    p_record_identifier_1      => l_tbl_ftl_mtl_transaction_stg(i).shipment_number||'-'||l_tbl_ftl_mtl_transaction_stg(i).item_number
+                   );
+             WHEN xx_emf_pkg.g_e_prc_error
+             THEN
+                xx_emf_pkg.write_log
+                   (xx_emf_cn_pkg.cn_low,
+                    'Process Level Error in Data Validations'
+                   );
+                xx_emf_pkg.error
+                   (p_severity                 => xx_emf_cn_pkg.cn_low,
+                    p_category                 => xx_emf_cn_pkg.cn_tech_error,
+                    p_error_text               =>    'Stage 2:Data Validation: g_e_prc_error=>'
+                                                  || SQLERRM,
+                    p_record_identifier_1      => l_tbl_ftl_mtl_transaction_stg(i).shipment_number||'-'||l_tbl_ftl_mtl_transaction_stg(i).item_number
+                   );
+                update_pre_interface_records(l_tbl_ftl_mtl_transaction_stg);
+                raise_application_error
+                                 (-20199,
+                                  xx_emf_cn_pkg.cn_prc_err
+                                 );
+             WHEN OTHERS
+             THEN
+                xx_emf_pkg.error
+                   (p_severity                 => xx_emf_cn_pkg.cn_low,
+                    p_category                 => xx_emf_cn_pkg.cn_tech_error,
+                    p_error_text               => xx_emf_cn_pkg.cn_exp_unhand,
+                    p_record_identifier_1      => l_tbl_ftl_mtl_transaction_stg(i).shipment_number||'-'||l_tbl_ftl_mtl_transaction_stg(i).item_number||'-'||SQLERRM
+                   );
+                update_pre_interface_records(l_tbl_ftl_mtl_transaction_stg);
+          END;
+        END LOOP;
+        update_pre_interface_records(l_tbl_ftl_mtl_transaction_stg);
+        l_tbl_ftl_mtl_transaction_stg.DELETE;
+        EXIT WHEN cr_ftl_mtl_tran_stg%NOTFOUND;
+    END LOOP;
+    IF cr_ftl_mtl_tran_stg%ISOPEN
+    THEN
+       CLOSE cr_ftl_mtl_tran_stg;
+    END IF;
+	-- Commented and added for MFG 2.1 Org wise run
+    --mark_records_complete (xx_emf_cn_pkg.cn_preval);       --------- marks it xx_emf_cn_pkg.cn_valid
+	mark_records_complete (xx_emf_cn_pkg.cn_preval, p_org_code);       --------- marks it xx_emf_cn_pkg.cn_valid
+
+-- Once data-validations are complete the loop through the pre-interface records
+-- and perform data derivations on this table
+-- Set the stage to data derivations
+   ------------------------------------------------------
+   ----------( Stage 3: Data Derivations)----------------
+   ------------------------------------------------------
+   fnd_file.put_line (fnd_file.log, 'step 2.2'  || to_char(sysdate, 'dd-mon-yyyy hh24:mi:ss'));
+      set_stage (xx_emf_cn_pkg.cn_derive);
+      xx_emf_pkg.write_log (xx_emf_cn_pkg.cn_low,
+                            'set_stage (xx_emf_cn_pkg.cn_derive)'
+                           );
+    -- Commented and added for MFG 2.1 Org wise run
+     -- OPEN cr_ftl_mtl_tran_stg(xx_emf_cn_pkg.cn_valid);
+      OPEN cr_ftl_mtl_tran_stg(xx_emf_cn_pkg.cn_valid, p_org_code);
+      LOOP
+         FETCH cr_ftl_mtl_tran_stg
+         BULK COLLECT INTO l_tbl_ftl_mtl_transaction_stg LIMIT xx_emf_cn_pkg.cn_bulk_collect;
+        xx_emf_pkg.write_log (xx_emf_cn_pkg.cn_low,
+                            'cr_ftl_mtl_tran_stg' ||xx_emf_cn_pkg.cn_preval
+                           );
+fnd_file.put_line (fnd_file.log, 'step 2.3'  || to_char(sysdate, 'dd-mon-yyyy hh24:mi:ss'));
+         FOR i IN 1 .. l_tbl_ftl_mtl_transaction_stg.COUNT
+         LOOP
+          BEGIN
+             -- Perform header Derivations
+             l_error_code := ftl_inv_intr_shipment_val.data_derivations(l_tbl_ftl_mtl_transaction_stg (i));
+             xx_emf_pkg.propagate_error (l_error_code);
+fnd_file.put_line (fnd_file.log, 'step 2.4'  || to_char(sysdate, 'dd-mon-yyyy hh24:mi:ss'));
+          EXCEPTION
+             -- If HIGH error then it will be propagated to the next level
+             -- IF the process has to continue maintain it as a medium severity
+             WHEN xx_emf_pkg.g_e_rec_error
+             THEN
+                fnd_file.put_line (1,
+                                      ' In Exception 1:'
+                                   || SQLERRM
+                                  );
+                xx_emf_pkg.write_log
+                                 (xx_emf_cn_pkg.cn_low,
+                                  xx_emf_cn_pkg.cn_rec_err
+                                 );
+                l_tbl_ftl_mtl_transaction_stg(i).ERROR_CODE :=
+                                  xx_emf_cn_pkg.cn_rec_err;
+                xx_emf_pkg.error
+                   (p_severity                 => xx_emf_cn_pkg.cn_low,
+                    p_category                 => xx_emf_cn_pkg.cn_tech_error,
+                    p_error_text               =>    'Stage 3:Data Derivations: g_e_rec_error=>'
+                                                  || SQLERRM,
+                    p_record_identifier_1      => l_tbl_ftl_mtl_transaction_stg(i).shipment_number||'-'||l_tbl_ftl_mtl_transaction_stg(i).item_number
+                   );
+             WHEN xx_emf_pkg.g_e_prc_error
+             THEN
+                xx_emf_pkg.write_log
+                   (xx_emf_cn_pkg.cn_low,
+                    'Process Level Error in Data Derivations'
+                   );
+                xx_emf_pkg.error
+                   (p_severity                 => xx_emf_cn_pkg.cn_low,
+                    p_category                 => xx_emf_cn_pkg.cn_tech_error,
+                    p_error_text               =>    'Stage 3:Data Derivations: g_e_prc_error=>'
+                                                  || SQLERRM,
+                    p_record_identifier_1      => l_tbl_ftl_mtl_transaction_stg(i).shipment_number||'-'||l_tbl_ftl_mtl_transaction_stg(i).item_number
+                   );
+                update_pre_interface_records(l_tbl_ftl_mtl_transaction_stg);
+                raise_application_error
+                                 (-20199,
+                                  xx_emf_cn_pkg.cn_prc_err
+                                 );
+             WHEN OTHERS
+             THEN
+                xx_emf_pkg.error
+                   (p_severity                 => xx_emf_cn_pkg.cn_low,
+                    p_category                 => xx_emf_cn_pkg.cn_tech_error,
+                    p_error_text               => xx_emf_cn_pkg.cn_exp_unhand,
+                    p_record_identifier_1      => l_tbl_ftl_mtl_transaction_stg(i).shipment_number||'-'||l_tbl_ftl_mtl_transaction_stg(i).item_number||'-'||SQLERRM
+                   );
+                update_pre_interface_records(l_tbl_ftl_mtl_transaction_stg);
+          END;
+        END LOOP;
+        update_pre_interface_records(l_tbl_ftl_mtl_transaction_stg);
+        l_tbl_ftl_mtl_transaction_stg.DELETE;
+        EXIT WHEN cr_ftl_mtl_tran_stg%NOTFOUND;
+    END LOOP;
+    IF cr_ftl_mtl_tran_stg%ISOPEN
+    THEN
+       CLOSE cr_ftl_mtl_tran_stg;
+    END IF;
+-- Commented and added for MFG 2.1 Org wise run
+   -- mark_records_complete (xx_emf_cn_pkg.cn_valid);       --------- marks it xx_emf_cn_pkg.cn_derive
+    mark_records_complete (xx_emf_cn_pkg.cn_valid , p_org_code);       --------- marks it xx_emf_cn_pkg.cn_derive
+------------------------------------------------------
+----------( Stage 4: Post Validations)----------------
+------------------------------------------------------
+-- Set the stage to Post Validations
+fnd_file.put_line (fnd_file.log, 'step 3'  || to_char(sysdate, 'dd-mon-yyyy hh24:mi:ss'));
+      set_stage (xx_emf_cn_pkg.cn_postval);
+      xx_emf_pkg.write_log (xx_emf_cn_pkg.cn_low,
+                            'set_stage (xx_emf_cn_pkg.cn_postval)'
+                           );
+      -- Change the validations package to the appropriate package name
+      -- Modify the parameters as required
+      -- DO NOT CHANGE ANYTHING ELSE IN THE CODE
+      -- PRE_VALIDATIONS SHOULD BE RETAINED
+    --  l_error_code := ftl_po_asl_val_pkg.post_validations;-- (g_batch_id);
+        l_error_code := ftl_inv_intr_shipment_val.post_validations;-- (g_batch_id);
+      xx_emf_pkg.write_log (xx_emf_cn_pkg.cn_medium,
+                               'After post-validations l_ERROR_CODE '
+                            || l_error_code
+                           );
+       -- Commented and added for MFG 2.1 Org wise run                    
+      --mark_records_complete (xx_emf_cn_pkg.cn_derive);       --------- marks it xx_emf_cn_pkg.cn_postval
+      mark_records_complete (xx_emf_cn_pkg.cn_derive, p_org_code);       --------- marks it xx_emf_cn_pkg.cn_postval
+      xx_emf_pkg.propagate_error (l_error_code);
+-- Set the stage to Post Validations
+------------------------------------------------------
+--------------( Stage 5: Process Data)----------------
+------------------------------------------------------
+-- Set the stage to Process Data
+      set_stage (xx_emf_cn_pkg.cn_process_data);
+      xx_emf_pkg.write_log (xx_emf_cn_pkg.cn_low,
+                            'set_stage (xx_emf_cn_pkg.cn_process_data)'
+                           );
+      --x_error_code := process_data (NULL, NULL);
+fnd_file.put_line (fnd_file.log, 'step 3.1'  || to_char(sysdate, 'dd-mon-yyyy hh24:mi:ss'));
+      process_data;
+fnd_file.put_line (fnd_file.log, 'step 4'  || to_char(sysdate, 'dd-mon-yyyy hh24:mi:ss'));
+    --  launch_process_transaction; Commented by Hari for AMS Incident 37304 - As suggested by VIdhu
+fnd_file.put_line (fnd_file.log, 'step 5'  || to_char(sysdate, 'dd-mon-yyyy hh24:mi:ss'));
+      fnd_file.put_line (fnd_file.log,'Before calling check_quantity procedure');
+      check_quantity;
+fnd_file.put_line (fnd_file.log, 'step 6'  || to_char(sysdate, 'dd-mon-yyyy hh24:mi:ss'));
+      fnd_file.put_line (fnd_file.log,'After calling check_quantity procedure');
+      -- Commented and added for MFG 2.1 Org wise run
+      --mark_records_complete (xx_emf_cn_pkg.cn_postval);      --------------- marks it xx_emf_cn_pkg.cn_process_data
+      mark_records_complete (xx_emf_cn_pkg.cn_postval, p_org_code);      --------------- marks it xx_emf_cn_pkg.cn_process_data
+fnd_file.put_line (fnd_file.log, 'step 7'  || to_char(sysdate, 'dd-mon-yyyy hh24:mi:ss'));
+      xx_emf_pkg.propagate_error (l_error_code);
+      update_record_count (l_err_count);
+fnd_file.put_line (fnd_file.log, 'step 8'  || to_char(sysdate, 'dd-mon-yyyy hh24:mi:ss'));
+      xx_emf_pkg.create_report;
+fnd_file.put_line (fnd_file.log, 'step 9'  || to_char(sysdate, 'dd-mon-yyyy hh24:mi:ss'));
+      IF l_err_count > 0
+      THEN
+         retcode := xx_emf_cn_pkg.cn_rec_warn;
+      END IF;
+   --  xx_emf_pkg.create_report;
+
+   --Check shipment with space (CR00015554)
+   BEGIN
+   -- Commented and added for MFG 2.1 Org wise run
+   -- FOR cur_recdv IN cur_dv 
+   FOR cur_recdv IN cur_dv  ( p_org_code)
+    LOOP
+        l_Cntspace :=l_Cntspace+1;
+
+      UPDATE ftl_cust.ftl_mtl_transaction_stg
+      SET process_code =xx_emf_cn_pkg.CN_VALID
+      WHERE shipment_number=cur_recdv.shipment_number
+      AND request_id   =xx_emf_pkg.g_request_id;
+    END LOOP;
+    COMMIT;
+  EXCEPTION
+  WHEN OTHERS THEN
+    NULL;
+  END;
+  IF l_Cntspace > 0
+    THEN
+    retcode := xx_emf_cn_pkg.cn_rec_warn;
+  END IF;
+    --Check shipment with space (CR00015554)
+
+
+   EXCEPTION
+      WHEN xx_emf_pkg.g_e_env_not_set
+      THEN
+         xx_emf_pkg.write_log (xx_emf_cn_pkg.cn_low,
+                               'Checking if this is OK');
+         fnd_file.put_line (fnd_file.output, xx_emf_pkg.cn_env_not_set);
+         retcode := xx_emf_cn_pkg.cn_rec_err;
+         update_record_count (l_err_count);
+         xx_emf_pkg.create_report;
+      WHEN xx_emf_pkg.g_e_rec_error
+      THEN
+         retcode := xx_emf_cn_pkg.cn_rec_err;
+         update_record_count (l_err_count);
+         xx_emf_pkg.create_report;
+      WHEN xx_emf_pkg.g_e_prc_error
+      THEN
+         retcode := xx_emf_cn_pkg.cn_prc_err;
+         update_record_count (l_err_count);
+         xx_emf_pkg.create_report;
+      WHEN OTHERS
+      THEN
+         retcode := xx_emf_cn_pkg.cn_prc_err;
+         update_record_count (l_err_count);
+         xx_emf_pkg.create_report;
+   END MAIN;
+END FTL_INV_INTR_SHIPMENT_INT;
